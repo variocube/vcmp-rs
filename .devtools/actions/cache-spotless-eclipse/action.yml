@@ -1,0 +1,21 @@
+name: Cache Spotless Eclipse formatter
+description: >-
+  Cache the Eclipse JDT formatter that Spotless resolves via Equo/P2 from
+  eclipse.org at build time. Without this, cold CI runners re-download the
+  formatter on every run, so an eclipse.org outage takes down all CI
+  (see variocube/safecube#1182). The cache is keyed on the Spotless setup
+  (build.gradle) plus the shared formatter config, so a version or config
+  bump busts it; only the first run afterwards re-fetches from eclipse.org.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Spotless Eclipse formatter (Equo P2)
+      uses: actions/cache@v4
+      with:
+        # Spotless (6.x/7.x) stores the resolved Equo P2 bundle-pool, metadata
+        # and queries here — not under ~/.gradle, so `cache: gradle` misses it.
+        path: ~/.m2/repository/dev/equo/p2-data
+        key: equo-p2-${{ runner.os }}-${{ hashFiles('build.gradle', 'build.gradle.kts', '.devtools/eclipse-formatter.xml') }}
+        restore-keys: |
+          equo-p2-${{ runner.os }}-

@@ -1,0 +1,27 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+# Unix-style newlines with a newline ending every file
+[*]
+charset = utf-8
+indent_style = tab
+indent_size = 4
+end_of_line = lf
+insert_final_newline = true
+
+# TypeScript
+[*.{ts,tsx}]
+
+# Java
+[*.java]
+
+# Shell
+[*.sh]
+
+# Language files: Lingohub insists on 2 spaces
+[**/i18n/**/*.json]
+indent_style = space
+indent_size = 2
+
+[*.yml]
+indent_style = space
+indent_size = 2
