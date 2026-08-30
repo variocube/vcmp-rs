@@ -1,0 +1,37 @@
+plugins {
+	id 'application'
+	id 'org.springframework.boot' version '3.4.12'
+	id 'io.spring.dependency-management' version '1.1.6'
+	id 'io.freefair.lombok' version '8.11'
+}
+
+group 'com.variocube'
+
+java {
+	toolchain {
+		languageVersion.set(JavaLanguageVersion.of(21))
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	// The real vcmp-spring, built from the sibling checkout (see settings.gradle).
+	implementation 'com.variocube:vcmp'
+	implementation 'org.springframework.boot:spring-boot-starter-web'
+	implementation 'org.springframework.boot:spring-boot-starter-websocket'
+}
+
+application {
+	mainClass = 'com.variocube.vcmp.contract.ContractPeer'
+}
+
+// A plain runnable jar (not the Spring Boot fat jar) is enough and starts faster.
+bootJar.enabled = false
+jar.enabled = true
+
+tasks.named('run') {
+	// forward `--args` verbatim; role/port/url are passed by the Rust test harness
+}

@@ -1,4 +1,20 @@
+# Rust
 /target
-Cargo.lock.bak
+Cargo.lock
+
 *.log
 .DS_Store
+
+# Contract test build artifacts
+/contract/js/node_modules
+/contract/java/.gradle
+/contract/java/build
+/contract/java/.kotlin
+
+# IDE / Eclipse (from LSP)
+/contract/java/bin
+/contract/java/.classpath
+/contract/java/.project
+/contract/java/.factorypath
+/contract/java/.settings
+.idea
