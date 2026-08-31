@@ -1,0 +1,71 @@
+[package]
+name = "vcmp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Variocube Messaging Protocol (VCMP) — wire-compatible Rust client and server"
+license = "MIT"
+repository = "https://github.com/variocube/vcmp-rs"
+publish = false
+
+[lib]
+doctest = false
+
+[features]
+default = ["client"]
+# WebSocket client with reconnect, custom headers and initial-heartbeat expectation.
+client = ["dep:tokio-tungstenite", "tokio-tungstenite/connect", "tokio/net"]
+# WebSocket server: acceptor, path-pattern endpoints, session sets, heartbeat initiation, broadcast.
+server = ["dep:tokio-tungstenite", "tokio/net"]
+# `wss://` support through rustls (pure Rust, no OpenSSL) with the bundled webpki roots.
+tls = ["client", "tokio-tungstenite/rustls-tls-webpki-roots", "dep:rustls"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = { version = "0.4", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { version = "2", default-features = false }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+futures-channel = { version = "0.3", features = ["sink"] }
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "io-util", "signal"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[[example]]
+name = "echo-driver"
+required-features = ["client"]
+
+[[example]]
+name = "echo-server"
+required-features = ["server"]
+
+[[test]]
+name = "client"
+required-features = ["client", "server"]
+
+[[test]]
+name = "server"
+required-features = ["client", "server"]
+
+[[test]]
+name = "contract_js"
+required-features = ["client", "server"]
+
+[[test]]
+name = "contract_java"
+required-features = ["client", "server"]
+
+# The measurement profile from the tracking issue: smallest possible static binary.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,38 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # The default (client-only, ws://) build is pure Rust: rust-lld links the static musl
+      # binary with no C cross-toolchain. The `tls` feature (wss:// via rustls/ring) needs a C
+      # cross-compiler, which the cube-internal ws:// driver does not — so it is not built here.
+      - name: Build echo-driver (release, static musl)
+        run: cargo build --release --example echo-driver --target ${{ matrix.target }}
+      - name: Report size
+        run: |
+          BIN=target/${{ matrix.target }}/release/examples/echo-driver
+          ls -l "$BIN"
+          cp "$BIN" "echo-driver-${{ matrix.target }}"
+      - name: Attach the binary to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: echo-driver-${{ matrix.target }}

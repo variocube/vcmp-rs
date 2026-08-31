@@ -1,0 +1,5 @@
+rootProject.name = 'vcmp-rs-contract-java'
+
+// Build vcmp-spring from the sibling checkout in the workspace, so the contract peer always
+// tests against the exact source the controller and center run.
+includeBuild('../../../vcmp-spring')

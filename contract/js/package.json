@@ -1,0 +1,10 @@
+{
+  "name": "vcmp-rs-contract-js",
+  "private": true,
+  "description": "vcmp-js peer for the vcmp-rs contract tests",
+  "dependencies": {
+    "@variocube/vcmp": "^4.0.0",
+    "@variocube/vcmp-server": "^4.0.0",
+    "ws": "^8.18.0"
+  }
+}
