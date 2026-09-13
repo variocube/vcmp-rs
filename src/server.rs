@@ -30,8 +30,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tracing::{debug, info, warn};
@@ -53,7 +55,8 @@ impl ServerBuilder {
 		self
 	}
 
-	/// Fragments outgoing messages into WebSocket frames of at most `size` bytes. Default: none.
+	/// Fragments outgoing messages into WebSocket frames of at most `size` bytes.
+	/// `None` (the default) or `Some(0)` disables fragmentation.
 	pub fn fragment_size(mut self, size: Option<usize>) -> Self {
 		self.transport.fragment_size = size;
 		self
@@ -65,7 +68,7 @@ impl ServerBuilder {
 		self
 	}
 
-	/// Builds the server. Add endpoints, then [`VcmpServer::bind`].
+	/// Builds the server. Add endpoints, then bind it or mount them in an axum router.
 	pub fn build(self) -> VcmpServer {
 		VcmpServer { inner: Arc::new(ServerInner { config: self, endpoints: RwLock::new(Vec::new()) }) }
 	}
@@ -90,11 +93,12 @@ impl VcmpServer {
 
 	/// Adds an endpoint for the given path pattern (e.g. `/drivers/{driver}`) and returns it.
 	///
-	/// Patterns are matched segment by segment in the order the endpoints were added; `{name}`
-	/// matches a single non-empty segment.
+	/// The bare server matches patterns segment by segment in registration order; `{name}`
+	/// matches a single non-empty segment. When mounted in axum, its router controls matching.
 	pub fn endpoint(&self, pattern: &str) -> Endpoint {
 		let endpoint = Endpoint {
 			inner: Arc::new(EndpointInner {
+				config: self.inner.config.clone(),
 				pattern: PathPattern::parse(pattern),
 				handlers: Arc::new(HandlerMap::new()),
 				sessions: Mutex::new(HashMap::new()),
@@ -109,6 +113,21 @@ impl VcmpServer {
 	/// The endpoints of this server.
 	pub fn endpoints(&self) -> Vec<Endpoint> {
 		self.inner.endpoints.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// Closes all currently connected sessions, failing their pending sends.
+	///
+	/// This does not stop the listener or prevent new sessions. When hosting with axum, stop
+	/// accepting requests before calling this; upgraded connections outlive the HTTP server.
+	/// Pending sends are settled before returning; disconnect hooks finish asynchronously.
+	pub async fn close_sessions(&self) {
+		let sessions: Vec<_> = self.endpoints().iter().flat_map(Endpoint::sessions).collect();
+		for session in &sessions {
+			session.close();
+		}
+		for session in &sessions {
+			session.closed().await;
+		}
 	}
 
 	/// Binds the listening socket and starts accepting connections in a background task.
@@ -171,20 +190,7 @@ impl VcmpServer {
 		let Some((endpoint, connect_info)) = matched else {
 			return;
 		};
-		let options = SessionOptions { handlers: endpoint.inner.handlers.clone(), connect_info: Some(connect_info) };
-		let session = spawn_session(options, &server.config.transport, ws);
-		info!(session = session.id(), %remote_addr, path = endpoint.path(), "session connected");
-		endpoint.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session.id(), session.clone());
-		session.initiate_heartbeat(server.config.heartbeat_interval);
-		if let Some(hook) = endpoint.inner.hook(&endpoint.inner.on_connected) {
-			hook(session.clone()).await;
-		}
-		session.closed().await;
-		endpoint.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id());
-		info!(session = session.id(), %remote_addr, path = endpoint.path(), "session disconnected");
-		if let Some(hook) = endpoint.inner.hook(&endpoint.inner.on_disconnected) {
-			hook(session).await;
-		}
+		endpoint.serve_websocket(connect_info, ws).await;
 	}
 }
 
@@ -216,25 +222,14 @@ impl ServerHandle {
 	/// Stops accepting connections and closes every session (failing their pending sends).
 	pub async fn stop(self) {
 		self.accept.abort();
-		let sessions: Vec<Session> = self
-			.server
-			.endpoints
-			.read()
-			.unwrap_or_else(|e| e.into_inner())
-			.iter()
-			.flat_map(Endpoint::sessions)
-			.collect();
-		for session in &sessions {
-			session.close();
-		}
-		for session in &sessions {
-			session.closed().await;
-		}
+		let _ = self.accept.await;
+		VcmpServer { inner: self.server }.close_sessions().await;
 		info!(local_addr = %self.local_addr, "server stopped");
 	}
 }
 
 struct EndpointInner {
+	config: ServerBuilder,
 	pattern: PathPattern,
 	handlers: Arc<HandlerMap>,
 	sessions: Mutex<HashMap<u64, Session>>,
@@ -256,6 +251,32 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+	#[cfg(feature = "axum")]
+	pub(crate) fn transport(&self) -> &TransportOptions {
+		&self.inner.config.transport
+	}
+
+	pub(crate) async fn serve_websocket<S>(&self, connect_info: ConnectInfo, ws: WebSocketStream<S>)
+	where
+		S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+	{
+		let remote_addr = connect_info.remote_addr;
+		let options = SessionOptions { handlers: self.inner.handlers.clone(), connect_info: Some(connect_info) };
+		let session = spawn_session(options, &self.inner.config.transport, ws);
+		info!(session = session.id(), ?remote_addr, path = self.path(), "session connected");
+		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session.id(), session.clone());
+		session.initiate_heartbeat(self.inner.config.heartbeat_interval);
+		if let Some(hook) = self.inner.hook(&self.inner.on_connected) {
+			hook(session.clone()).await;
+		}
+		session.closed().await;
+		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id());
+		info!(session = session.id(), ?remote_addr, path = self.path(), "session disconnected");
+		if let Some(hook) = self.inner.hook(&self.inner.on_disconnected) {
+			hook(session).await;
+		}
+	}
+
 	/// The path pattern of this endpoint.
 	pub fn path(&self) -> &str {
 		&self.inner.pattern.source

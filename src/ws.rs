@@ -89,24 +89,27 @@ where
 	})
 }
 
-/// Splits a text message into WebSocket frames of at most `fragment_size` bytes (on character
-/// boundaries), like the Java client's 8 KB `MAX_TEXT_MESSAGE_BUFFER_SIZE` does.
+/// Splits a text message into WebSocket frames of at most `fragment_size` bytes, preferring
+/// character boundaries. If a character cannot fit, its bytes span multiple frames; WebSocket
+/// text messages need valid UTF-8 only after reassembly.
 fn messages(text: String, fragment_size: Option<usize>) -> Vec<Message> {
 	match fragment_size {
 		Some(size) if size > 0 && text.len() > size => {
 			let mut frames = Vec::with_capacity(text.len().div_ceil(size));
-			let mut rest = text.as_str();
-			let mut first = true;
-			while !rest.is_empty() {
-				let mut end = rest.len().min(size);
-				while !rest.is_char_boundary(end) {
+			let mut start = 0;
+			while start < text.len() {
+				let limit = start + (text.len() - start).min(size);
+				let mut end = limit;
+				while end > start && !text.is_char_boundary(end) {
 					end -= 1;
 				}
-				let (chunk, tail) = rest.split_at(end);
-				rest = tail;
-				let opcode = OpCode::Data(if first { Data::Text } else { Data::Continue });
-				first = false;
-				frames.push(Message::Frame(WsFrame::message(chunk.to_owned(), opcode, rest.is_empty())));
+				if end == start {
+					end = limit;
+				}
+				let opcode = OpCode::Data(if start == 0 { Data::Text } else { Data::Continue });
+				let chunk = text.as_bytes()[start..end].to_vec();
+				frames.push(Message::Frame(WsFrame::message(chunk, opcode, end == text.len())));
+				start = end;
 			}
 			frames
 		}
@@ -158,5 +161,46 @@ mod tests {
 			reassembled.push_str(frame.to_text().unwrap());
 		}
 		assert_eq!(reassembled, text);
+	}
+
+	#[test]
+	fn fragments_characters_larger_than_the_frame_limit() {
+		let text = "ä水🦀aä水🦀";
+		for size in 1..=3 {
+			let frames = messages(text.into(), Some(size));
+			let mut reassembled = Vec::new();
+			for (i, frame) in frames.iter().enumerate() {
+				let Message::Frame(frame) = frame else { panic!("expected a raw frame") };
+				assert!(!frame.payload().is_empty());
+				assert!(frame.payload().len() <= size);
+				let expected = OpCode::Data(if i == 0 { Data::Text } else { Data::Continue });
+				assert_eq!(frame.header().opcode, expected);
+				assert_eq!(frame.header().is_final, i == frames.len() - 1);
+				reassembled.extend_from_slice(frame.payload());
+			}
+			assert_eq!(String::from_utf8(reassembled).unwrap(), text);
+		}
+	}
+
+	#[tokio::test]
+	async fn peer_reassembles_text_split_inside_characters() {
+		use tokio_tungstenite::tungstenite::protocol::Role;
+
+		let text = "ä水🦀aä水🦀";
+		for size in 1..=3 {
+			let (sender, receiver) = tokio::io::duplex(4096);
+			let mut sender = WebSocketStream::from_raw_socket(sender, Role::Server, None).await;
+			let config = WebSocketConfig::default().max_frame_size(Some(size));
+			let mut receiver = WebSocketStream::from_raw_socket(receiver, Role::Client, Some(config)).await;
+			for frame in messages(text.into(), Some(size)) {
+				sender.send(frame).await.unwrap();
+			}
+			let message = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.next())
+				.await
+				.unwrap()
+				.unwrap()
+				.unwrap();
+			assert!(matches!(message, Message::Text(received) if received == text));
+		}
 	}
 }

@@ -10,6 +10,7 @@
 //! - [`session`]: the protocol state machine over an abstract text-frame duplex.
 //! - [`client`] (feature `client`): a reconnecting WebSocket client.
 //! - [`server`] (feature `server`): a WebSocket server with path-pattern endpoints.
+//! - [`axum`] (feature `axum`): VCMP endpoints alongside HTTP routes in an axum router.
 //!
 //! ```ignore
 //! use vcmp::{VcmpClient, VcmpMessage, Backoff};
@@ -36,6 +37,8 @@ pub mod error;
 pub mod frame;
 pub mod session;
 
+#[cfg(feature = "axum")]
+pub mod axum;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "server")]

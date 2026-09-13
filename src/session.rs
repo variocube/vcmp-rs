@@ -63,7 +63,7 @@ pub trait VcmpMessage: Serialize + DeserializeOwned {
 pub struct ConnectInfo {
 	/// The request path (without query string).
 	pub path: String,
-	/// The path parameters of the matched endpoint pattern, e.g. `driver` for `/drivers/{driver}`.
+	/// The path parameters of the matched route or endpoint, e.g. `driver` for `/drivers/{driver}`.
 	pub params: HashMap<String, String>,
 	/// The request headers, as sent (names lower-cased; non-UTF-8 values are lossily converted).
 	pub headers: Vec<(String, String)>,

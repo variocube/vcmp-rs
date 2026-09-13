@@ -15,7 +15,7 @@ run_js() {
 	echo "==> building the vcmp-js peer"
 	(cd contract/js && npm ci)
 	echo "==> Rust <-> vcmp-js"
-	cargo test --features "client server" --test contract_js -- --ignored --nocapture
+	cargo test --features "client server axum" --test contract_js -- --ignored --nocapture
 }
 
 run_java() {
@@ -26,7 +26,7 @@ run_java() {
 	echo "==> building the vcmp-spring peer (installDist)"
 	./contract/java/gradlew -p contract/java installDist
 	echo "==> Rust <-> vcmp-spring"
-	cargo test --features "client server" --test contract_java -- --ignored --nocapture
+	cargo test --features "client server axum" --test contract_java -- --ignored --nocapture
 }
 
 case "$what" in

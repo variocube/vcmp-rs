@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title>VCMP sessions</title>
+		<style>
+			:root { font: 16px/1.5 system-ui, sans-serif; color-scheme: light dark; }
+			body { max-width: 54rem; margin: 3rem auto; padding: 0 1.5rem; }
+			h1 { margin-bottom: .25rem; }
+			button { padding: .5rem 1rem; font: inherit; cursor: pointer; }
+			pre { padding: 1rem; background: light-dark(#f2f4f7, #20252c); overflow: auto; border-radius: .5rem; }
+			code { font-size: .9rem; }
+			#status { min-height: 1.5rem; }
+		</style>
+	</head>
+	<body>
+		<h1>VCMP sessions</h1>
+		<p>VCMP, REST and this page share one HTTP listener.</p>
+		<p>Connect the echo driver from the repository:</p>
+		<pre><code id="command">cargo run --example echo-driver -- ws://127.0.0.1:2000/drivers/echo --announce</code></pre>
+		<p><a href="/api/sessions">GET /api/sessions</a> lists the connected drivers.</p>
+		<button id="refresh" type="button">Refresh sessions</button>
+		<p id="status" role="status"></p>
+		<pre id="sessions">[]</pre>
+		<script>
+			const command = document.querySelector("#command");
+			const refresh = document.querySelector("#refresh");
+			const status = document.querySelector("#status");
+			const sessions = document.querySelector("#sessions");
+			const scheme = location.protocol === "https:" ? "wss" : "ws";
+			command.textContent = `cargo run --example echo-driver -- ${scheme}://${location.host}/drivers/echo --announce`;
+
+			async function loadSessions() {
+				refresh.disabled = true;
+				status.textContent = "Loading sessions…";
+				try {
+					const response = await fetch("/api/sessions", { cache: "no-store" });
+					if (!response.ok) throw new Error(`HTTP ${response.status}`);
+					const data = await response.json();
+					sessions.textContent = JSON.stringify(data, null, 2);
+					status.textContent = `${data.length} connected session${data.length === 1 ? "" : "s"}.`;
+				} catch (error) {
+					status.textContent = `Could not load sessions: ${error.message}`;
+				} finally {
+					refresh.disabled = false;
+				}
+			}
+
+			refresh.addEventListener("click", loadSessions);
+			loadSessions();
+		</script>
+	</body>
+</html>
