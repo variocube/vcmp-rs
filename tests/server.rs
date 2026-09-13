@@ -14,6 +14,7 @@ server_tests!(
 	broadcasts_and_reports_per_session_results,
 	server_initiates_the_heartbeat_and_closes_silent_peers,
 	stop_closes_all_sessions,
+	close_sessions_keeps_accepting_new_connections,
 	server_side_sends_are_handled_by_the_client,
 	max_message_size_rejects_oversized_messages,
 	fragments_outgoing_messages,
@@ -151,6 +152,29 @@ async fn stop_closes_all_sessions(host: ServerHost) {
 		client.stop();
 	}
 	assert_eq!(endpoint.session_count(), 0);
+}
+
+async fn close_sessions_keeps_accepting_new_connections(host: ServerHost) {
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/test/{name}");
+	register(endpoint.handlers());
+	let handle = host.bind(server.clone(), 0).await;
+	let url = format!("ws://{}/test/reopen", handle.local_addr());
+	let first = VcmpClient::builder(&url).reconnect(vcmp::Backoff::fixed(Duration::from_secs(60))).build();
+	first.start();
+	connected(&first).await;
+	wait_until(|| endpoint.session_count() == 1).await;
+	server.close_sessions().await;
+	disconnected(&first).await;
+	first.stop();
+	wait_until(|| endpoint.session_count() == 0).await;
+
+	let later = client(&url);
+	later.start();
+	connected(&later).await;
+	assert_eq!(later.send(&Echo { payload: "after closing".into() }).await.unwrap(), "after closing");
+	later.stop();
+	handle.stop().await;
 }
 
 async fn server_side_sends_are_handled_by_the_client(host: ServerHost) {
@@ -358,5 +382,86 @@ async fn axum_root_route_works_without_peer_address_extension() {
 	assert_eq!(info.remote_addr, None);
 	assert_eq!(client.send(&Echo { payload: "root".into() }).await.unwrap(), "root");
 	client.stop();
+	handle.stop().await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_close_sessions_waits_for_accepted_upgrades_before_registration() {
+	axum_close_sessions_during_upgrade(true).await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_close_sessions_finishes_when_an_accepted_upgrade_fails() {
+	axum_close_sessions_during_upgrade(false).await;
+}
+
+#[cfg(feature = "axum")]
+async fn axum_close_sessions_during_upgrade(accept: bool) {
+	use axum::{Router, routing::get};
+	use tokio::sync::mpsc;
+	use vcmp::axum::VcmpUpgrade;
+
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/test/{name}");
+	let (sessions_tx, mut sessions_rx) = mpsc::unbounded_channel();
+	endpoint.on_session_connected(move |session| {
+		let sessions_tx = sessions_tx.clone();
+		async move {
+			sessions_tx.send(session.clone()).unwrap();
+			// Closing must be able to settle the session while this hook is still running.
+			session.closed().await;
+		}
+	});
+	let (closing_tx, mut closing_rx) = mpsc::unbounded_channel();
+	let route_endpoint = endpoint.clone();
+	let route_server = server.clone();
+	let router = Router::new().route(
+		endpoint.path(),
+		get(move |upgrade: VcmpUpgrade| {
+			let endpoint = route_endpoint.clone();
+			let server = route_server.clone();
+			let closing_tx = closing_tx.clone();
+			async move {
+				let response = endpoint.on_upgrade(upgrade);
+				let mut closing = Box::pin(async move { server.close_sessions().await });
+				// Poll before returning the HTTP response, so the upgrade cannot register a session yet.
+				let first_poll = std::future::poll_fn(|cx| std::task::Poll::Ready(closing.as_mut().poll(cx))).await;
+				assert!(first_poll.is_pending());
+				assert_eq!(endpoint.session_count(), 0);
+				closing_tx.send(tokio::spawn(closing)).unwrap();
+				if accept { response } else { std::future::pending().await }
+			}
+		}),
+	);
+	let handle = HostHandle::axum(server, router, 0).await;
+	let connection = tokio::spawn(tokio_tungstenite::connect_async(format!("ws://{}/test/race", handle.local_addr())));
+	let closing = tokio::time::timeout(Duration::from_secs(5), closing_rx.recv()).await.unwrap().unwrap();
+	let peer = if accept {
+		Some(connection.await.unwrap().unwrap().0)
+	} else {
+		// Drop the client before the handler returns its response, making the HTTP upgrade fail.
+		connection.abort();
+		assert!(connection.await.unwrap_err().is_cancelled());
+		None
+	};
+	tokio::time::timeout(Duration::from_secs(5), closing).await.unwrap().unwrap();
+	if let Some(mut peer) = peer {
+		let session = tokio::time::timeout(Duration::from_secs(5), sessions_rx.recv()).await.unwrap().unwrap();
+		assert!(!session.is_open());
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while let Some(Ok(message)) = peer.next().await {
+				if matches!(message, Message::Close(_)) {
+					break;
+				}
+			}
+		})
+		.await
+		.unwrap();
+	} else {
+		assert!(sessions_rx.try_recv().is_err());
+	}
+	wait_until(|| endpoint.session_count() == 0).await;
 	handle.stop().await;
 }

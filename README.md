@@ -173,7 +173,9 @@ async fn driver_upgrade(State(state): State<AppState>, upgrade: VcmpUpgrade) -> 
 `WebSocketUpgrade` does not expose the raw frames needed for outgoing fragmentation and cannot
 be passed to `Endpoint::on_upgrade`. Axum's graceful shutdown finishes HTTP connections;
 call `server.close_sessions().await` afterward to close upgraded VCMP sessions and fail pending
-sends. The standalone `server.bind(...)` API remains available with the `server` feature.
+sends. This also waits for already accepted upgrades to register their sessions or fail, so an
+upgrade finishing during HTTP shutdown cannot leave a connection open. Session hooks finish
+asynchronously. The standalone `server.bind(...)` API remains available with the `server` feature.
 
 The complete [axum example](examples/axum-server.rs) serves `/drivers/{driver}`, the JSON REST
 endpoint `/api/sessions` and a [static dashboard](examples/static/index.html) on the same port.

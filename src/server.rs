@@ -102,6 +102,8 @@ impl VcmpServer {
 				pattern: PathPattern::parse(pattern),
 				handlers: Arc::new(HandlerMap::new()),
 				sessions: Mutex::new(HashMap::new()),
+				#[cfg(feature = "axum")]
+				pending_upgrades: tokio::sync::watch::channel(0).0,
 				on_connected: Mutex::new(None),
 				on_disconnected: Mutex::new(None),
 			}),
@@ -118,10 +120,18 @@ impl VcmpServer {
 	/// Closes all currently connected sessions, failing their pending sends.
 	///
 	/// This does not stop the listener or prevent new sessions. When hosting with axum, stop
-	/// accepting requests before calling this; upgraded connections outlive the HTTP server.
+	/// the HTTP server before calling this; upgraded connections outlive it. Accepted axum
+	/// upgrades are allowed to register their sessions or fail before sessions are collected.
 	/// Pending sends are settled before returning; disconnect hooks finish asynchronously.
 	pub async fn close_sessions(&self) {
-		let sessions: Vec<_> = self.endpoints().iter().flat_map(Endpoint::sessions).collect();
+		let endpoints = self.endpoints();
+		#[cfg(feature = "axum")]
+		for endpoint in &endpoints {
+			let mut pending = endpoint.inner.pending_upgrades.subscribe();
+			// Hyper can finish the HTTP connection before the upgrade task registers its session.
+			let _ = pending.wait_for(|count| *count == 0).await;
+		}
+		let sessions: Vec<_> = endpoints.iter().flat_map(Endpoint::sessions).collect();
 		for session in &sessions {
 			session.close();
 		}
@@ -190,7 +200,8 @@ impl VcmpServer {
 		let Some((endpoint, connect_info)) = matched else {
 			return;
 		};
-		endpoint.serve_websocket(connect_info, ws).await;
+		let session = endpoint.start_session(connect_info, ws);
+		endpoint.serve_session(session).await;
 	}
 }
 
@@ -233,6 +244,8 @@ struct EndpointInner {
 	pattern: PathPattern,
 	handlers: Arc<HandlerMap>,
 	sessions: Mutex<HashMap<u64, Session>>,
+	#[cfg(feature = "axum")]
+	pending_upgrades: tokio::sync::watch::Sender<usize>,
 	on_connected: Mutex<Option<SessionHook>>,
 	on_disconnected: Mutex<Option<SessionHook>>,
 }
@@ -240,6 +253,17 @@ struct EndpointInner {
 impl EndpointInner {
 	fn hook(&self, slot: &Mutex<Option<SessionHook>>) -> Option<SessionHook> {
 		slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+}
+
+/// Keeps shutdown waiting until an accepted upgrade has registered its session or failed.
+#[cfg(feature = "axum")]
+pub(crate) struct PendingUpgrade(tokio::sync::watch::Sender<usize>);
+
+#[cfg(feature = "axum")]
+impl Drop for PendingUpgrade {
+	fn drop(&mut self) {
+		self.0.send_modify(|count| *count -= 1);
 	}
 }
 
@@ -252,11 +276,18 @@ pub struct Endpoint {
 
 impl Endpoint {
 	#[cfg(feature = "axum")]
+	pub(crate) fn begin_upgrade(&self) -> PendingUpgrade {
+		let pending = self.inner.pending_upgrades.clone();
+		pending.send_modify(|count| *count += 1);
+		PendingUpgrade(pending)
+	}
+
+	#[cfg(feature = "axum")]
 	pub(crate) fn transport(&self) -> &TransportOptions {
 		&self.inner.config.transport
 	}
 
-	pub(crate) async fn serve_websocket<S>(&self, connect_info: ConnectInfo, ws: WebSocketStream<S>)
+	pub(crate) fn start_session<S>(&self, connect_info: ConnectInfo, ws: WebSocketStream<S>) -> Session
 	where
 		S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 	{
@@ -266,11 +297,16 @@ impl Endpoint {
 		info!(session = session.id(), ?remote_addr, path = self.path(), "session connected");
 		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session.id(), session.clone());
 		session.initiate_heartbeat(self.inner.config.heartbeat_interval);
+		session
+	}
+
+	pub(crate) async fn serve_session(&self, session: Session) {
 		if let Some(hook) = self.inner.hook(&self.inner.on_connected) {
 			hook(session.clone()).await;
 		}
 		session.closed().await;
 		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id());
+		let remote_addr = session.connect_info().and_then(|info| info.remote_addr);
 		info!(session = session.id(), ?remote_addr, path = self.path(), "session disconnected");
 		if let Some(hook) = self.inner.hook(&self.inner.on_disconnected) {
 			hook(session).await;

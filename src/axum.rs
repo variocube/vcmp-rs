@@ -117,6 +117,7 @@ impl Endpoint {
 	/// ```
 	pub fn on_upgrade(&self, upgrade: VcmpUpgrade) -> Response {
 		let endpoint = self.clone();
+		let pending = endpoint.begin_upgrade();
 		tokio::spawn(async move {
 			let io = match upgrade.on_upgrade.await {
 				Ok(io) => io,
@@ -131,7 +132,10 @@ impl Endpoint {
 				Some(endpoint.transport().websocket_config()),
 			)
 			.await;
-			endpoint.serve_websocket(upgrade.connect_info, ws).await;
+			let session = endpoint.start_session(upgrade.connect_info, ws);
+			// Release shutdown only after insertion, without waiting for application hooks.
+			drop(pending);
+			endpoint.serve_session(session).await;
 		});
 		upgrade.response
 	}
