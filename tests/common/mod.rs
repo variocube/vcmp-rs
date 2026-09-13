@@ -1,9 +1,14 @@
 //! Shared helpers of the socket-level integration tests.
 #![allow(dead_code)]
 
+#[path = "../server_host/mod.rs"]
+pub mod server_host;
+pub(crate) use server_host::server_tests;
+pub use server_host::{HostHandle, ServerHost};
+
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use vcmp::{Backoff, Endpoint, ServerHandle, VcmpClient, VcmpError, VcmpMessage, VcmpServer};
+use vcmp::{Backoff, Endpoint, VcmpClient, VcmpError, VcmpMessage, VcmpServer};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(tag = "@type", rename = "test:Echo")]
@@ -65,21 +70,12 @@ pub fn init_tracing() {
 	let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_test_writer().try_init();
 }
 
-/// Starts a server with a `/test/{name}` endpoint carrying the standard handlers.
-pub async fn start_server(heartbeat: Duration) -> (ServerHandle, Endpoint) {
+/// Starts either host with a `/test/{name}` endpoint carrying the standard handlers.
+pub async fn start_hosted_server(host: ServerHost, port: u16, heartbeat: Duration) -> (HostHandle, Endpoint) {
 	let server = VcmpServer::builder().heartbeat_interval(heartbeat).build();
 	let endpoint = server.endpoint("/test/{name}");
 	register(endpoint.handlers());
-	let handle = server.bind("127.0.0.1:0").await.unwrap();
-	(handle, endpoint)
-}
-
-/// Starts a server on a specific port (for restart scenarios).
-pub async fn start_server_on(port: u16, heartbeat: Duration) -> (ServerHandle, Endpoint) {
-	let server = VcmpServer::builder().heartbeat_interval(heartbeat).build();
-	let endpoint = server.endpoint("/test/{name}");
-	register(endpoint.handlers());
-	let handle = server.bind(("127.0.0.1", port)).await.unwrap();
+	let handle = host.bind(server, port).await;
 	(handle, endpoint)
 }
 

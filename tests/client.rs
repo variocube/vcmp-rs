@@ -11,10 +11,21 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use vcmp::{Backoff, VcmpClient};
 
-#[tokio::test]
-async fn sends_and_receives_acknowledgements() {
+server_tests!(
+	sends_and_receives_acknowledgements,
+	transfers_large_messages,
+	transfers_fragmented_messages,
+	settles_concurrent_sends_in_any_order,
+	exchanges_heartbeats,
+	reconnects_after_a_server_restart,
+	stop_fails_pending_sends_and_does_not_reconnect,
+	start_cancels_a_pending_reconnect_and_replaces_the_session,
+	keeps_retrying_when_the_server_is_unreachable_or_rejects,
+);
+
+async fn sends_and_receives_acknowledgements(host: ServerHost) {
 	init_tracing();
-	let (server, _endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	client.start();
 	connected(&client).await;
@@ -37,10 +48,9 @@ async fn sends_and_receives_acknowledgements() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn transfers_large_messages() {
+async fn transfers_large_messages(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	client.start();
 	connected(&client).await;
@@ -57,10 +67,9 @@ async fn transfers_large_messages() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn transfers_fragmented_messages() {
+async fn transfers_fragmented_messages(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let client = VcmpClient::builder(format!("ws://{}/test/a", server.local_addr())).fragment_size(Some(8192)).build();
 	register(client.handlers());
 	client.start();
@@ -72,10 +81,9 @@ async fn transfers_fragmented_messages() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn settles_concurrent_sends_in_any_order() {
+async fn settles_concurrent_sends_in_any_order(host: ServerHost) {
 	init_tracing();
-	let (server, _endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	client.start();
 	connected(&client).await;
@@ -90,10 +98,9 @@ async fn settles_concurrent_sends_in_any_order() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn exchanges_heartbeats() {
+async fn exchanges_heartbeats(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_millis(100)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_millis(100)).await;
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	client.start();
 	connected(&client).await;
@@ -189,11 +196,10 @@ async fn initial_heartbeat_expectation_can_be_disabled() {
 	client.stop();
 }
 
-#[tokio::test]
-async fn reconnects_after_a_server_restart() {
+async fn reconnects_after_a_server_restart(host: ServerHost) {
 	init_tracing();
 	let port = free_port();
-	let (server, _endpoint) = start_server_on(port, Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	let client = client(&format!("ws://127.0.0.1:{port}/test/a"));
 	let opens = Arc::new(AtomicUsize::new(0));
 	let closes = Arc::new(AtomicUsize::new(0));
@@ -219,7 +225,7 @@ async fn reconnects_after_a_server_restart() {
 	let error = client.send(&Void {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
 
-	let (server, _endpoint) = start_server_on(port, Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	connected(&client).await;
 	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
 	assert_eq!(opens.load(Ordering::SeqCst), 2);
@@ -230,10 +236,9 @@ async fn reconnects_after_a_server_restart() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn stop_fails_pending_sends_and_does_not_reconnect() {
+async fn stop_fails_pending_sends_and_does_not_reconnect(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	client.start();
 	connected(&client).await;
@@ -254,11 +259,10 @@ async fn stop_fails_pending_sends_and_does_not_reconnect() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn start_cancels_a_pending_reconnect_and_replaces_the_session() {
+async fn start_cancels_a_pending_reconnect_and_replaces_the_session(host: ServerHost) {
 	init_tracing();
 	let port = free_port();
-	let (server, _endpoint) = start_server_on(port, Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	let client = VcmpClient::builder(format!("ws://127.0.0.1:{port}/test/a"))
 		.reconnect(Backoff::fixed(Duration::from_secs(60)))
 		.build();
@@ -267,7 +271,7 @@ async fn start_cancels_a_pending_reconnect_and_replaces_the_session() {
 	server.stop().await;
 	disconnected(&client).await;
 	// a reconnect is pending in 60 s; start() must connect right away instead
-	let (server, endpoint) = start_server_on(port, Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	client.start();
 	connected(&client).await;
 	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
@@ -283,8 +287,7 @@ async fn start_cancels_a_pending_reconnect_and_replaces_the_session() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn keeps_retrying_when_the_server_is_unreachable_or_rejects() {
+async fn keeps_retrying_when_the_server_is_unreachable_or_rejects(host: ServerHost) {
 	init_tracing();
 	let port = free_port();
 	let client = client(&format!("ws://127.0.0.1:{port}/nope"));
@@ -292,7 +295,7 @@ async fn keeps_retrying_when_the_server_is_unreachable_or_rejects() {
 	tokio::time::sleep(Duration::from_millis(300)).await;
 	assert!(!client.is_connected());
 	// a server without that endpoint rejects with 404; the client keeps retrying
-	let (server, _endpoint) = start_server_on(port, Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	tokio::time::sleep(Duration::from_millis(300)).await;
 	assert!(!client.is_connected());
 	client.stop();

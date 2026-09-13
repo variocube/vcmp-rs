@@ -129,6 +129,7 @@ impl ClientBuilder {
 
 	/// Fragments outgoing messages into WebSocket frames of at most `size` bytes (the Java client
 	/// uses 8 KB). Default: no fragmentation — each message is sent as one frame.
+	/// `None` or `Some(0)` disables fragmentation.
 	pub fn fragment_size(mut self, size: Option<usize>) -> Self {
 		self.transport.fragment_size = size;
 		self

@@ -77,9 +77,20 @@ async fn rust_client_against_spring_server() {
 #[tokio::test]
 #[ignore = "needs a JDK and the vcmp-spring checkout"]
 async fn rust_server_against_spring_client() {
+	server_against_spring_client(ServerHost::Bare).await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+#[ignore = "needs a JDK and the vcmp-spring checkout"]
+async fn axum_server_against_spring_client() {
+	server_against_spring_client(ServerHost::Axum).await;
+}
+
+async fn server_against_spring_client(host: ServerHost) {
 	init_tracing();
 	let port = free_port();
-	let (server, endpoint) = rust_server(port, Duration::from_millis(200)).await;
+	let (server, endpoint) = rust_server(host, port, Duration::from_millis(200)).await;
 	let url = format!("ws://127.0.0.1:{port}/peer/java");
 	let mut client = java_client(&url).await;
 	client.wait_for("CONNECTED", 1).await;
@@ -97,7 +108,7 @@ async fn rust_server_against_spring_client() {
 	// server restart → the Spring client reconnects and a send after reconnect succeeds
 	server.stop().await;
 	client.wait_for("DISCONNECTED", 1).await;
-	let (server, endpoint) = rust_server(port, Duration::from_millis(200)).await;
+	let (server, endpoint) = rust_server(host, port, Duration::from_millis(200)).await;
 	client.wait_for("CONNECTED", 2).await;
 	wait_until(|| endpoint.session_count() == 1).await;
 	let session = endpoint.sessions().pop().unwrap();

@@ -5,6 +5,10 @@
 //! run in both directions: Rust client ↔ peer server, Rust server ↔ peer client.
 #![allow(dead_code)]
 
+#[path = "../server_host/mod.rs"]
+pub mod server_host;
+pub use server_host::{HostHandle, ServerHost};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::process::Stdio;
@@ -12,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use vcmp::{Backoff, Endpoint, ProblemDetail, ServerHandle, Session, VcmpClient, VcmpError, VcmpMessage, VcmpServer};
+use vcmp::{Backoff, Endpoint, ProblemDetail, Session, VcmpClient, VcmpError, VcmpMessage, VcmpServer};
 
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -161,11 +165,11 @@ pub fn rust_client(url: &str) -> VcmpClient {
 	client
 }
 
-pub async fn rust_server(port: u16, heartbeat: Duration) -> (ServerHandle, Endpoint) {
+pub async fn rust_server(host: ServerHost, port: u16, heartbeat: Duration) -> (HostHandle, Endpoint) {
 	let server = VcmpServer::builder().heartbeat_interval(heartbeat).build();
 	let endpoint = server.endpoint("/peer/{name}");
 	register(endpoint.handlers());
-	let handle = server.bind(("127.0.0.1", port)).await.unwrap();
+	let handle = host.bind(server, port).await;
 	(handle, endpoint)
 }
 

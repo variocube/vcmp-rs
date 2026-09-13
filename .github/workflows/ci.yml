@@ -20,6 +20,19 @@ jobs:
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Test (default features)
         run: cargo test
+      - name: Check isolated features
+        run: |
+          cargo check --no-default-features
+          cargo check --no-default-features --features server
+          cargo check --no-default-features --features axum
+      - name: Client and bare server stay free of axum and hyper
+        run: |
+          for features in client server; do
+            vcmp_dependencies=$(cargo tree --no-default-features --features "$features" --edges normal --prefix none)
+            if printf '%s\n' "$vcmp_dependencies" | grep -Eq '^(axum|hyper|hyper-util) v'; then
+              exit 1
+            fi
+          done
       - name: Test (all features)
         run: cargo test --all-features
 
@@ -54,4 +67,4 @@ jobs:
         run: ./gradlew installDist
       - name: Contract tests (Rust ↔ vcmp-js, Rust ↔ vcmp-spring)
         working-directory: vcmp-rs
-        run: cargo test --features "client server" --test contract_js --test contract_java -- --ignored
+        run: cargo test --features "client server axum" --test contract_js --test contract_java -- --ignored

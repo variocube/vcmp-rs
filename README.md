@@ -43,8 +43,10 @@ Add it as a git dependency (not published to crates.io):
 vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.1.0" }
 ```
 
-Feature flags: `client` (default), `server`, `tls` (`wss://` via rustls, pure-Rust crypto only for
-native builds — see [Cross-compilation](#cross-compilation)). The drivers only need `client`.
+Feature flags: `client` (default), `server`, `axum` (includes `server`), `tls` (`wss://` via
+rustls, pure-Rust crypto only for native builds — see [Cross-compilation](#cross-compilation)).
+The drivers only need `client`. The axum/hyper dependencies are optional: builds with only
+`client` or `server` retain the lightweight standalone transport.
 
 A message type is any `Serialize + Deserialize` whose `@type` is the serde tag:
 
@@ -109,6 +111,85 @@ let results = drivers.broadcast(&msg).await;                          // per-ses
 handle.stop().await;                                                 // closes every session
 ```
 
+### Sharing an axum listener
+
+Enable `axum` to mount VCMP endpoints in an axum 0.8 router alongside REST handlers, static
+files and middleware. VCMP uses HTTP/1.1 WebSocket upgrades; the host application owns the
+listener and HTTP shutdown:
+
+```toml
+[dependencies]
+vcmp = { git = "https://github.com/variocube/vcmp-rs", default-features = false, features = ["axum"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+```
+
+```rust
+use std::net::SocketAddr;
+use axum::{Router, routing::get};
+use vcmp::VcmpServer;
+
+let server = VcmpServer::builder().build();
+let drivers = server.endpoint("/drivers/{driver}");
+// Register VCMP message handlers and session hooks on `drivers` as above.
+let app = Router::new()
+    .route(drivers.path(), drivers.axum_route())
+    .route("/health", get(|| async { "ok" }));
+let listener = tokio::net::TcpListener::bind("0.0.0.0:2000").await?;
+let result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+    .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+    .await;
+server.close_sessions().await;
+result?;
+```
+
+`Endpoint::axum_route()` works with router state, nesting and tower middleware. Session
+`ConnectInfo` contains the original request path, axum's decoded path parameters and request
+headers. `remote_addr` is populated when the host uses
+`into_make_service_with_connect_info::<SocketAddr>()`; otherwise it is `None`.
+
+For application-specific authentication or other extractors, use `vcmp::axum::VcmpUpgrade` in a
+custom handler and pass it to `Endpoint::on_upgrade` after checking the request:
+
+```rust
+use axum::{extract::State, http::StatusCode, response::{IntoResponse, Response}, routing::get};
+use vcmp::{Endpoint, axum::VcmpUpgrade};
+
+#[derive(Clone)]
+struct AppState { drivers: Endpoint, authorization: String }
+
+async fn driver_upgrade(State(state): State<AppState>, upgrade: VcmpUpgrade) -> Response {
+    if upgrade.connect_info().header("authorization") != Some(state.authorization.as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.drivers.on_upgrade(upgrade)
+}
+
+// Register with `.route(drivers.path(), get(driver_upgrade)).with_state(state)`.
+```
+
+`VcmpUpgrade` uses hyper's HTTP upgrade and the existing tungstenite transport, preserving
+`ServerBuilder::fragment_size`, message limits, VCMP heartbeat and session hooks. Axum's native
+`WebSocketUpgrade` does not expose the raw frames needed for outgoing fragmentation and cannot
+be passed to `Endpoint::on_upgrade`. Axum's graceful shutdown finishes HTTP connections;
+call `server.close_sessions().await` afterward to close upgraded VCMP sessions and fail pending
+sends. This also waits for already accepted upgrades to register their sessions or fail, so an
+upgrade finishing during HTTP shutdown cannot leave a connection open. Session hooks finish
+asynchronously. The standalone `server.bind(...)` API remains available with the `server` feature.
+
+The complete [axum example](examples/axum-server.rs) serves `/drivers/{driver}`, the JSON REST
+endpoint `/api/sessions` and a [static dashboard](examples/static/index.html) on the same port.
+The example uses `tower-http` with its `fs` feature to serve the static directory:
+
+```bash
+cargo run --example axum-server --features axum -- 127.0.0.1:2000
+# In another terminal:
+curl http://127.0.0.1:2000/                  # static dashboard
+curl http://127.0.0.1:2000/api/sessions      # JSON, initially []
+cargo run --example echo-driver -- ws://127.0.0.1:2000/drivers/echo --announce
+# Refresh the dashboard or GET /api/sessions to see the connected driver.
+```
+
 Errors: `VcmpError` *is* a `ProblemDetail` (+ an optional source). Any `std::error::Error` converts
 to a `500` with `title` = the error's type name and `detail` = its message; a `503` is a local,
 retryable transport condition (`Session not open` / `Session closed` / `Not connected`).
@@ -117,7 +198,7 @@ retryable transport condition (`Session not open` / `Session closed` / `Not conn
 
 ```bash
 cargo build                 # client only (default)
-cargo build --all-features  # client + server + tls
+cargo build --all-features  # client + server + axum + tls
 cargo test --all-features   # unit + loopback + socket-level tests
 cargo clippy --all-features --all-targets
 ```
@@ -128,6 +209,9 @@ Formatting is `cargo fmt` (tabs, width 120 — see `rustfmt.toml`, matching the 
 
 `contract/` holds a cross-implementation suite that runs the crate against the **real** other
 implementations, both directions, so wire compatibility is a test rather than a hope:
+
+The Rust server scenarios run against both the bare listener and axum host. `contract/run.sh`
+and CI enable the `axum` feature to exercise both.
 
 | Rust side | Peer | Peer source |
 |-----------|------|-------------|

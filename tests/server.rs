@@ -3,12 +3,24 @@
 mod common;
 
 use common::*;
+use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use vcmp::{ConnectInfo, VcmpClient, VcmpError, VcmpServer};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
+use vcmp::{ConnectInfo, Frame, VcmpClient, VcmpError, VcmpServer};
 
-#[tokio::test]
-async fn routes_by_path_and_exposes_connect_info() {
+server_tests!(
+	routes_by_path_and_exposes_connect_info,
+	broadcasts_and_reports_per_session_results,
+	server_initiates_the_heartbeat_and_closes_silent_peers,
+	stop_closes_all_sessions,
+	close_sessions_keeps_accepting_new_connections,
+	server_side_sends_are_handled_by_the_client,
+	max_message_size_rejects_oversized_messages,
+	fragments_outgoing_messages,
+);
+
+async fn routes_by_path_and_exposes_connect_info(host: ServerHost) {
 	init_tracing();
 	let server = VcmpServer::builder().build();
 	let drivers = server.endpoint("/drivers/{driver}");
@@ -32,7 +44,7 @@ async fn routes_by_path_and_exposes_connect_info() {
 			*d.lock().unwrap() += 1;
 		}
 	});
-	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let handle = host.bind(server, 0).await;
 
 	let driver = VcmpClient::builder(format!("ws://{}/drivers/kerong?x=1", handle.local_addr()))
 		.header("Authorization", "Bearer secret")
@@ -63,10 +75,9 @@ async fn routes_by_path_and_exposes_connect_info() {
 	handle.stop().await;
 }
 
-#[tokio::test]
-async fn broadcasts_and_reports_per_session_results() {
+async fn broadcasts_and_reports_per_session_results(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let ok = client(&format!("ws://{}/test/ok", server.local_addr()));
 	let failing = VcmpClient::builder(format!("ws://{}/test/failing", server.local_addr())).build();
 	register(failing.handlers());
@@ -104,10 +115,9 @@ async fn broadcasts_and_reports_per_session_results() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn server_initiates_the_heartbeat_and_closes_silent_peers() {
+async fn server_initiates_the_heartbeat_and_closes_silent_peers(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_millis(100)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_millis(100)).await;
 	// a raw peer that never answers the heartbeat
 	let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/test/silent", server.local_addr())).await.unwrap();
 	wait_until(|| endpoint.session_count() == 1).await;
@@ -120,10 +130,9 @@ async fn server_initiates_the_heartbeat_and_closes_silent_peers() {
 	server.stop().await;
 }
 
-#[tokio::test]
-async fn stop_closes_all_sessions() {
+async fn stop_closes_all_sessions(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let clients: Vec<_> = (0..3)
 		.map(|i| {
 			let client = VcmpClient::builder(format!("ws://{}/test/{i}", server.local_addr()))
@@ -145,10 +154,32 @@ async fn stop_closes_all_sessions() {
 	assert_eq!(endpoint.session_count(), 0);
 }
 
-#[tokio::test]
-async fn server_side_sends_are_handled_by_the_client() {
+async fn close_sessions_keeps_accepting_new_connections(host: ServerHost) {
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/test/{name}");
+	register(endpoint.handlers());
+	let handle = host.bind(server.clone(), 0).await;
+	let url = format!("ws://{}/test/reopen", handle.local_addr());
+	let first = VcmpClient::builder(&url).reconnect(vcmp::Backoff::fixed(Duration::from_secs(60))).build();
+	first.start();
+	connected(&first).await;
+	wait_until(|| endpoint.session_count() == 1).await;
+	server.close_sessions().await;
+	disconnected(&first).await;
+	first.stop();
+	wait_until(|| endpoint.session_count() == 0).await;
+
+	let later = client(&url);
+	later.start();
+	connected(&later).await;
+	assert_eq!(later.send(&Echo { payload: "after closing".into() }).await.unwrap(), "after closing");
+	later.stop();
+	handle.stop().await;
+}
+
+async fn server_side_sends_are_handled_by_the_client(host: ServerHost) {
 	init_tracing();
-	let (server, endpoint) = start_server(Duration::from_secs(20)).await;
+	let (server, endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	client.start();
 	connected(&client).await;
@@ -159,4 +190,278 @@ async fn server_side_sends_are_handled_by_the_client() {
 	assert_eq!(error.status(), 500);
 	client.stop();
 	server.stop().await;
+}
+
+async fn max_message_size_rejects_oversized_messages(host: ServerHost) {
+	for fragment_size in [None, Some(64)] {
+		let server = VcmpServer::builder().max_message_size(256).build();
+		let endpoint = server.endpoint("/test/{name}");
+		register(endpoint.handlers());
+		let server = host.bind(server, 0).await;
+		let client = VcmpClient::builder(format!("ws://{}/test/size", server.local_addr()))
+			.fragment_size(fragment_size)
+			.reconnect(vcmp::Backoff::fixed(Duration::from_secs(60)))
+			.build();
+		client.start();
+		connected(&client).await;
+		assert_eq!(client.send(&Echo { payload: "small".into() }).await.unwrap(), "small");
+		let error = tokio::time::timeout(Duration::from_secs(5), client.send(&Echo { payload: "x".repeat(1024) }))
+			.await
+			.unwrap()
+			.unwrap_err();
+		assert_eq!((error.status(), error.title()), (503, "Session closed"));
+		disconnected(&client).await;
+		wait_until(|| endpoint.session_count() == 0).await;
+		client.stop();
+		server.stop().await;
+	}
+}
+
+async fn fragments_outgoing_messages(host: ServerHost) {
+	let server = VcmpServer::builder().fragment_size(Some(32)).build();
+	let endpoint = server.endpoint("/test/{name}");
+	register(endpoint.handlers());
+	let server = host.bind(server, 0).await;
+	// A peer accepting at most 32 bytes per frame proves the server actually fragments the reply.
+	let config = WebSocketConfig::default().max_frame_size(Some(32));
+	let (mut peer, _) = tokio_tungstenite::connect_async_with_config(
+		format!("ws://{}/test/fragmented", server.local_addr()),
+		Some(config),
+		false,
+	)
+	.await
+	.unwrap();
+	let payload = "ä水🦀".repeat(256);
+	let message = Frame::message(serde_json::to_string(&Echo { payload: payload.clone() }).unwrap());
+	peer.send(Message::Text(message.serialize().into())).await.unwrap();
+	let reply = tokio::time::timeout(Duration::from_secs(5), async {
+		loop {
+			let Message::Text(text) = peer.next().await.unwrap().unwrap() else { continue };
+			match Frame::parse(&text).unwrap() {
+				Frame::Heartbeat { .. } => continue,
+				frame => break frame,
+			}
+		}
+	})
+	.await
+	.unwrap();
+	assert_eq!(reply, Frame::ack(message.id().unwrap(), Some(serde_json::to_string(&payload).unwrap())));
+	peer.close(None).await.unwrap();
+	wait_until(|| endpoint.session_count() == 0).await;
+	server.stop().await;
+}
+
+#[cfg(feature = "axum")]
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+	stream
+		.write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
+		.await
+		.unwrap();
+	let mut response = String::new();
+	tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response)).await.unwrap().unwrap();
+	response
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_shares_a_port_with_rest_and_static_files_and_preserves_nested_params() {
+	use axum::{Router, extract::State, routing::get};
+	use tower_http::services::ServeDir;
+
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/drivers/{driver}");
+	register(endpoint.handlers());
+	let router = Router::new()
+		.route("/health", get(|State(state): State<String>| async move { state }))
+		.nest_service("/static", ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/static")))
+		.nest("/sites/{site}", Router::new().route(endpoint.path(), endpoint.axum_route()))
+		.with_state("ready".to_owned());
+	let handle = HostHandle::axum(server, router, 0).await;
+	let path = "/sites/vienna/drivers/kerong%20one";
+	let client = VcmpClient::builder(format!("ws://{}{path}?x=1", handle.local_addr()))
+		.header("Authorization", "Bearer secret")
+		.build();
+	client.start();
+	connected(&client).await;
+	wait_until(|| endpoint.session_count() == 1).await;
+	let session = endpoint.sessions().pop().unwrap();
+	let info = session.connect_info().unwrap();
+	assert_eq!(info.path, path);
+	assert_eq!(info.param("site"), Some("vienna"));
+	assert_eq!(info.param("driver"), Some("kerong one"));
+	assert_eq!(info.header("AUTHORIZATION"), Some("Bearer secret"));
+	assert!(info.remote_addr.unwrap().ip().is_loopback());
+
+	let response = http_get(handle.local_addr(), "/health").await;
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+	assert!(response.ends_with("ready"), "{response}");
+	let response = http_get(handle.local_addr(), "/static/index.html").await;
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+	assert!(response.ends_with(include_str!("../examples/static/index.html")), "{response}");
+	assert_eq!(client.send(&Echo { payload: "same port".into() }).await.unwrap(), "same port");
+
+	// Ordinary HTTP requests cannot create sessions, and undecodable route captures fail the upgrade.
+	let response = http_get(handle.local_addr(), path).await;
+	assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{response}");
+	let error = tokio_tungstenite::connect_async(format!("ws://{}/sites/vienna/drivers/%FF", handle.local_addr()))
+		.await
+		.unwrap_err();
+	let tokio_tungstenite::tungstenite::Error::Http(response) = error else { panic!("{error}") };
+	assert_eq!(response.status(), 400);
+	assert_eq!(endpoint.session_count(), 1);
+	client.stop();
+	handle.stop().await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_upgrade_helper_works_in_a_handler_with_application_state() {
+	use axum::{
+		Router,
+		extract::State,
+		http::{HeaderMap, StatusCode},
+		response::IntoResponse,
+		routing::get,
+	};
+	use vcmp::axum::VcmpUpgrade;
+
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/drivers/{driver}");
+	register(endpoint.handlers());
+	let route_endpoint = endpoint.clone();
+	let router = Router::new()
+		.route(
+			endpoint.path(),
+			get(move |State(token): State<String>, headers: HeaderMap, upgrade: VcmpUpgrade| {
+				let endpoint = route_endpoint.clone();
+				async move {
+					if headers.get("authorization").and_then(|value| value.to_str().ok()) != Some(token.as_str()) {
+						return StatusCode::UNAUTHORIZED.into_response();
+					}
+					endpoint.on_upgrade(upgrade)
+				}
+			}),
+		)
+		.with_state("Bearer secret".to_owned());
+	let handle = HostHandle::axum(server, router, 0).await;
+	let url = format!("ws://{}/drivers/authorized", handle.local_addr());
+	let error = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+	let tokio_tungstenite::tungstenite::Error::Http(response) = error else { panic!("{error}") };
+	assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+	assert_eq!(endpoint.session_count(), 0);
+
+	let client = VcmpClient::builder(url).header("Authorization", "Bearer secret").build();
+	client.start();
+	connected(&client).await;
+	assert_eq!(client.send(&Echo { payload: "authorized".into() }).await.unwrap(), "authorized");
+	client.stop();
+	handle.stop().await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_root_route_works_without_peer_address_extension() {
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/");
+	register(endpoint.handlers());
+	let router = axum::Router::new().route(endpoint.path(), endpoint.axum_route());
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let local_addr = listener.local_addr().unwrap();
+	let accept = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+	let handle = HostHandle::Axum { server, local_addr, accept };
+	let client = client(&format!("ws://{local_addr}/"));
+	client.start();
+	connected(&client).await;
+	wait_until(|| endpoint.session_count() == 1).await;
+	let session = endpoint.sessions().pop().unwrap();
+	let info = session.connect_info().unwrap();
+	assert_eq!(info.path, "/");
+	assert!(info.params.is_empty());
+	assert_eq!(info.remote_addr, None);
+	assert_eq!(client.send(&Echo { payload: "root".into() }).await.unwrap(), "root");
+	client.stop();
+	handle.stop().await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_close_sessions_waits_for_accepted_upgrades_before_registration() {
+	axum_close_sessions_during_upgrade(true).await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_close_sessions_finishes_when_an_accepted_upgrade_fails() {
+	axum_close_sessions_during_upgrade(false).await;
+}
+
+#[cfg(feature = "axum")]
+async fn axum_close_sessions_during_upgrade(accept: bool) {
+	use axum::{Router, routing::get};
+	use tokio::sync::mpsc;
+	use vcmp::axum::VcmpUpgrade;
+
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/test/{name}");
+	let (sessions_tx, mut sessions_rx) = mpsc::unbounded_channel();
+	endpoint.on_session_connected(move |session| {
+		let sessions_tx = sessions_tx.clone();
+		async move {
+			sessions_tx.send(session.clone()).unwrap();
+			// Closing must be able to settle the session while this hook is still running.
+			session.closed().await;
+		}
+	});
+	let (closing_tx, mut closing_rx) = mpsc::unbounded_channel();
+	let route_endpoint = endpoint.clone();
+	let route_server = server.clone();
+	let router = Router::new().route(
+		endpoint.path(),
+		get(move |upgrade: VcmpUpgrade| {
+			let endpoint = route_endpoint.clone();
+			let server = route_server.clone();
+			let closing_tx = closing_tx.clone();
+			async move {
+				let response = endpoint.on_upgrade(upgrade);
+				let mut closing = Box::pin(async move { server.close_sessions().await });
+				// Poll before returning the HTTP response, so the upgrade cannot register a session yet.
+				let first_poll = std::future::poll_fn(|cx| std::task::Poll::Ready(closing.as_mut().poll(cx))).await;
+				assert!(first_poll.is_pending());
+				assert_eq!(endpoint.session_count(), 0);
+				closing_tx.send(tokio::spawn(closing)).unwrap();
+				if accept { response } else { std::future::pending().await }
+			}
+		}),
+	);
+	let handle = HostHandle::axum(server, router, 0).await;
+	let connection = tokio::spawn(tokio_tungstenite::connect_async(format!("ws://{}/test/race", handle.local_addr())));
+	let closing = tokio::time::timeout(Duration::from_secs(5), closing_rx.recv()).await.unwrap().unwrap();
+	let peer = if accept {
+		Some(connection.await.unwrap().unwrap().0)
+	} else {
+		// Drop the client before the handler returns its response, making the HTTP upgrade fail.
+		connection.abort();
+		assert!(connection.await.unwrap_err().is_cancelled());
+		None
+	};
+	tokio::time::timeout(Duration::from_secs(5), closing).await.unwrap().unwrap();
+	if let Some(mut peer) = peer {
+		let session = tokio::time::timeout(Duration::from_secs(5), sessions_rx.recv()).await.unwrap().unwrap();
+		assert!(!session.is_open());
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while let Some(Ok(message)) = peer.next().await {
+				if matches!(message, Message::Close(_)) {
+					break;
+				}
+			}
+		})
+		.await
+		.unwrap();
+	} else {
+		assert!(sessions_rx.try_recv().is_err());
+	}
+	wait_until(|| endpoint.session_count() == 0).await;
+	handle.stop().await;
 }

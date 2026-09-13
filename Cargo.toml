@@ -17,12 +17,17 @@ default = ["client"]
 client = ["dep:tokio-tungstenite", "tokio-tungstenite/connect", "tokio/net"]
 # WebSocket server: acceptor, path-pattern endpoints, session sets, heartbeat initiation, broadcast.
 server = ["dep:tokio-tungstenite", "tokio/net"]
+# VCMP endpoints in an axum router, sharing its port with HTTP routes and services.
+axum = ["server", "dep:axum", "dep:hyper", "dep:hyper-util"]
 # `wss://` support through rustls (pure Rust, no OpenSSL) with the bundled webpki roots.
 tls = ["client", "tokio-tungstenite/rustls-tls-webpki-roots", "dep:rustls"]
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = { version = "0.4", default-features = false }
+hyper = { version = "1", default-features = false, features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +41,7 @@ futures-channel = { version = "0.3", features = ["sink"] }
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "io-util", "signal"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [[example]]
@@ -45,6 +51,10 @@ required-features = ["client"]
 [[example]]
 name = "echo-server"
 required-features = ["server"]
+
+[[example]]
+name = "axum-server"
+required-features = ["axum"]
 
 [[test]]
 name = "client"
