@@ -63,6 +63,8 @@ SHA-256 (`5a1a6cf113398b4f630750adae7ae4f6df9348325e1601cf625b1674a4ceb241`).
 
 ## Initial heartbeat race recovery
 
+This fix is included in release `0.3.1`.
+
 Controller stage 4/5 CI exposed a healthy extension connection closing at its ten-second initial heartbeat deadline.
 The client transport reader can accept the server's immediate `HBT` before the client connect task invokes
 `expect_heartbeat`. The old implementation then installed a startup watchdog over the already accepted heartbeat;
