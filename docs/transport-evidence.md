@@ -13,7 +13,7 @@ recorded 2026-09-14. The public contracts and host responsibilities are in
   were not imported.
 - JavaScript wire peers: npm `@variocube/vcmp` and `@variocube/vcmp-server` `4.0.0`, using
   the existing committed `contract/js/package-lock.json` integrity hashes.
-- This transport change is committed unreleased code; no release or production deployment is claimed.
+- This transport change is included in release `0.3.0`; no production deployment is claimed.
 
 ## Executed checks
 

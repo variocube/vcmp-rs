@@ -41,7 +41,7 @@ Add it as a git dependency (not published to crates.io):
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.2.0" }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.3.0" }
 ```
 
 Feature flags: `client` (default), `server`, `axum` (includes `server`), `tls` (`wss://` via
@@ -120,7 +120,7 @@ listener and HTTP shutdown:
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.2.0", default-features = false, features = ["axum"] }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.3.0", default-features = false, features = ["axum"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 ```
@@ -198,10 +198,9 @@ retryable transport condition (`Session not open` / `Session closed` / `Not conn
 ## Bounded transport and lifecycle
 
 The transport foundation for [controller-rs #2](https://github.com/variocube/controller-rs/issues/2)
-adds `SessionLimits`, `ResourceLimits` and `ResourceBudget`. This code is an unreleased successor
-to released tag `0.2.0` (`a55bde01c122be90412dd453368f52d4047e67fe`); consumers must pin the
-reviewed companion PR commit with `rev`, not assume these APIs are present in `0.2.0`. The
-original checkout was clean at review; no uncommitted source changes were imported.
+adds `SessionLimits`, `ResourceLimits` and `ResourceBudget`, available in release `0.3.0`.
+The review baseline was released tag `0.2.0` (`a55bde01c122be90412dd453368f52d4047e67fe`).
+The original checkout was clean at review; no uncommitted source changes were imported.
 
 ```rust
 use vcmp::{ResourceBudget, ResourceLimits, SessionLimits, VcmpServer};
