@@ -40,3 +40,12 @@ The protocol peer suites retain malformed JSON/unknown message behavior, ACK/NAK
 100 KiB/1 MiB payloads, concurrency, heartbeat and reconnect behavior. No physical board, fleet,
 full-process RSS, flash-write or application recovery qualification was performed in this library
 change. HTTP admission before an axum upgrade and blocking application workers are host-owned.
+
+## PR review corrections
+
+The follow-up fixes release the original outgoing payload before awaiting an acknowledgement and
+preserve standalone listener operation when its `ServerHandle` is dropped. The allocation regression
+in `tests/payload_retention.rs` and the detached-listener regression in `tests/server.rs` both fail
+before their respective fixes and pass afterward. All 115 Rust tests pass, along with formatting,
+clippy with warnings denied, default-feature tests and isolated-feature checks.
+The external JS/Java contract results above were recorded before these review corrections.

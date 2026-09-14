@@ -172,7 +172,10 @@ impl VcmpServer {
 		let server = self.inner.clone();
 		server.stopped.store(false, Ordering::SeqCst);
 		let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+		let stop_guard = stop.clone();
 		let accept = tokio::spawn(async move {
+			// Dropping the handle detaches the listener; only an explicit stop ends it.
+			let _stop_guard = stop_guard;
 			let mut connections = JoinSet::new();
 			loop {
 				let accepted = tokio::select! {

@@ -486,6 +486,21 @@ async fn connection_budget_rejects_overload_then_recovers(host: ServerHost) {
 }
 
 #[tokio::test]
+async fn bare_dropping_handle_keeps_listener_running() {
+	let server = VcmpServer::builder().build();
+	server.endpoint("/detached");
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let url = format!("ws://{}/detached", handle.local_addr());
+	drop(handle);
+	let (mut peer, _) = tokio::time::timeout(Duration::from_secs(1), tokio_tungstenite::connect_async(url))
+		.await
+		.expect("the detached listener must keep accepting connections")
+		.expect("dropping the handle must not stop the server");
+	peer.close(None).await.unwrap();
+	server.close_sessions().await;
+}
+
+#[tokio::test]
 async fn bare_slow_handshake_is_bounded_and_shutdown_cannot_create_a_late_session() {
 	let budget = vcmp::ResourceBudget::new(vcmp::ResourceLimits { connections: 1, ..Default::default() });
 	let limits = vcmp::SessionLimits { shutdown_timeout: Duration::from_millis(40), ..Default::default() };

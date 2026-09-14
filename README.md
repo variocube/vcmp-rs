@@ -278,6 +278,10 @@ closes a session whose open hook cannot run; close hooks are best effort under o
 not be the only owner of required durable cleanup. Axum close hooks finish asynchronously within
 the configured deadline, as in the existing integration contract.
 
+Written requests release their serialized payloads before waiting for acknowledgements; only
+correlation state remains pending. Dropping a standalone `ServerHandle` detaches the listener;
+retain the handle and call `stop().await` to shut it down.
+
 Resource snapshots count retained wire bytes and active reservations, including in-flight writes;
 they do not measure allocator overhead, JSON object expansion, kernel buffers or application
 allocations. Each admitted WebSocket can additionally hold its bounded reassembly buffer. Actual
@@ -288,11 +292,12 @@ untracked work from these callbacks. Routine transport logs exclude payloads, UR
 `Debug` output redacts connection headers, paths/parameters and client URLs.
 
 Executable coverage is in `tests/bounds.rs` (counts/bytes, non-ACKing peers, drop/deadline cleanup,
-control priority, stalled writes, oversized frames and old-handler cancellation), `tests/client.rs`
+control priority, stalled writes, oversized frames and old-handler cancellation),
+`tests/payload_retention.rs` (allocation release before acknowledgement), `tests/client.rs`
 (fresh credentials, cancellation and replacement), and `tests/server.rs` (bare/axum admission,
-slow handshakes and shutdown). The existing codec/property/socket and JS/Java contract suites
-continue to check the deployed wire format. Application authorization and durable replay/recovery
-are intentionally outside this protocol crate.
+slow handshakes, detached listeners and shutdown). The existing codec/property/socket and JS/Java
+contract suites continue to check the deployed wire format. Application authorization and durable
+replay/recovery are intentionally outside this protocol crate.
 
 ## Building
 

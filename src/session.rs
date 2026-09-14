@@ -461,6 +461,8 @@ impl Session {
 		}
 		let _cleanup = PendingCleanup { session: self.clone(), id };
 		self.enqueue(frame.serialize(), false)?;
+		// Only the queued copy owns byte permits; do not retain the original payload while awaiting an ACK.
+		drop(frame);
 		match tokio::time::timeout(self.inner.limits.request_timeout, rx).await {
 			Ok(Ok(result)) => result,
 			Ok(Err(_)) => Err(VcmpError::session_closed("The session closed before acknowledgement.")),
