@@ -428,6 +428,25 @@ async fn expected_heartbeat_keeps_the_session_open_when_it_arrives() {
 }
 
 #[tokio::test]
+async fn late_initial_heartbeat_expectation_preserves_an_already_received_heartbeat() {
+	let (session, mut peer) = loopback(handlers());
+	peer.inject("HBT100");
+	timeout(Duration::from_secs(2), async {
+		while session.heartbeats_received() == 0 {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	// A client can receive the server's immediate HBT before its connect task arms the initial watchdog.
+	// That watchdog must not replace the accepted heartbeat's longer echo/response schedule.
+	session.expect_heartbeat(Duration::from_millis(10));
+	assert_eq!(peer.next_frame().await, Frame::heartbeat(100));
+	assert!(session.is_open());
+	session.close();
+}
+
+#[tokio::test]
 async fn transport_write_failure_closes_the_session() {
 	let (session, peer) = loopback(handlers());
 	drop(peer);

@@ -252,6 +252,11 @@ writer on deadline, drains queues and settles pending requests before `closed()`
 ids identify connection generations. Replacing a client connection cancels its old hook/task and
 closes its session; old completions cannot install or clear the replacement session.
 
+The client's initial heartbeat deadline applies only until the first valid heartbeat arrives. Receiving that first
+heartbeat before the connect task installs its initial watchdog preserves the negotiated echo/response schedule; it
+cannot rearm a stale startup deadline over an already healthy connection. `tests/session.rs` deterministically covers
+both arrival orders and still rejects a peer that never sends its first heartbeat.
+
 `headers_per_attempt` generates synthetic or real credentials inside the connection deadline,
 once for each attempt, replacing static headers with the same name:
 

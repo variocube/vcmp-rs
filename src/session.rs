@@ -487,9 +487,13 @@ impl Session {
 	///
 	/// Meant for the non-initiating side, whose watchdog otherwise only starts with the first
 	/// received heartbeat — without this, a peer that completes the handshake but never sends
-	/// anything would go undetected.
+	/// anything would go undetected. If the first heartbeat has already arrived, its negotiated
+	/// schedule remains in effect and this initial expectation does nothing.
 	pub fn expect_heartbeat(&self, timeout: Duration) {
-		if !self.is_open() {
+		let mut heartbeat = self.inner.heartbeat.lock().unwrap_or_else(|e| e.into_inner());
+		// The transport reader can accept the server's first HBT before the client's connect task reaches here.
+		// Check and install under the same lock as handle_heartbeat so neither order can leave a stale watchdog.
+		if !self.is_open() || self.inner.heartbeats_received.load(Ordering::Relaxed) != 0 {
 			return;
 		}
 		let session = self.clone();
@@ -499,7 +503,7 @@ impl Session {
 			session.close();
 		})
 		.abort_handle();
-		let previous = self.inner.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).watchdog.replace(watchdog);
+		let previous = heartbeat.watchdog.replace(watchdog);
 		if let Some(previous) = previous {
 			previous.abort();
 		}

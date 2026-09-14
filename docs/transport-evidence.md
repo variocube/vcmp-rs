@@ -60,3 +60,26 @@ isolated-feature checks, and the client/server dependency isolation check. All t
 and all three Java directions were rerun after these corrections and pass against the same peers
 listed above. The installed Java peer's `vcmp.jar` matches the isolated released-source build by
 SHA-256 (`5a1a6cf113398b4f630750adae7ae4f6df9348325e1601cf625b1674a4ceb241`).
+
+## Initial heartbeat race recovery
+
+Controller stage 4/5 CI exposed a healthy extension connection closing at its ten-second initial heartbeat deadline.
+The client transport reader can accept the server's immediate `HBT` before the client connect task invokes
+`expect_heartbeat`. The old implementation then installed a startup watchdog over the already accepted heartbeat;
+the controller's negotiated fifteen-second echo interval could not satisfy that stale ten-second deadline.
+
+The correction was developed from released `0.3.0` commit `6fc6d2b` in an isolated persistent worktree. It is a subsequent
+source change, not evidence that the published `0.3.0` already contained the fix. Watchdog installation and the check for
+an already received heartbeat now share the heartbeat-state lock. Negotiated intervals and initial deadlines remain
+unchanged, including closure when the first heartbeat never arrives.
+
+On 2026-09-14, `late_initial_heartbeat_expectation_preserves_an_already_received_heartbeat` first reproduced the failure
+against `6fc6d2b`: inject `HBT100`, wait until it is accepted, then arm a ten-millisecond initial expectation. The old
+session closed before its scheduled echo. With the fix, the expected echo is received and the session remains open.
+The existing tests retain coverage for the opposite arrival order and absent heartbeats.
+
+`cargo fmt --all`, `cargo test --locked --all-features` (123 passed, six external peer tests ignored) and
+`cargo clippy --locked --all-features --all-targets -- -D warnings` pass. Builds used `CARGO_BUILD_JOBS=4`,
+`RUST_TEST_THREADS=2`, and the existing disk-backed target directory. The library does not track `Cargo.lock`; its
+existing local lockfile was reused and reconciled offline before the locked checks. The JavaScript/Java peer suites
+were not rerun for this correction, and controller candidate evidence must identify its updated dependency revision.
