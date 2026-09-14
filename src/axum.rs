@@ -117,12 +117,16 @@ impl Endpoint {
 	/// ```
 	pub fn on_upgrade(&self, upgrade: VcmpUpgrade) -> Response {
 		let endpoint = self.clone();
-		let pending = endpoint.begin_upgrade();
+		let mut pending = match endpoint.begin_upgrade() {
+			Ok(pending) => pending,
+			Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "Transport overloaded").into_response(),
+		};
 		tokio::spawn(async move {
-			let io = match upgrade.on_upgrade.await {
-				Ok(io) => io,
-				Err(error) => {
-					debug!("WebSocket upgrade failed: {error}");
+			let io = match tokio::time::timeout(endpoint.transport().limits.shutdown_timeout, upgrade.on_upgrade).await
+			{
+				Ok(Ok(io)) => io,
+				_ => {
+					debug!("WebSocket upgrade failed or timed out");
 					return;
 				}
 			};
@@ -132,7 +136,7 @@ impl Endpoint {
 				Some(endpoint.transport().websocket_config()),
 			)
 			.await;
-			let session = endpoint.start_session(upgrade.connect_info, ws);
+			let session = endpoint.start_session(upgrade.connect_info, ws, pending.1.take().expect("admitted upgrade"));
 			// Release shutdown only after insertion, without waiting for application hooks.
 			drop(pending);
 			endpoint.serve_session(session).await;

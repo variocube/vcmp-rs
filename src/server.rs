@@ -18,8 +18,10 @@
 //! The server initiates the heartbeat on every session (20 s by default).
 
 use crate::error::VcmpError;
+use crate::resources::{Permit, Resource};
 use crate::session::{ConnectInfo, HandlerMap, Session, SessionOptions, VcmpMessage};
 use crate::ws::{Headers, TransportOptions, spawn_session};
+use crate::{ResourceBudget, SessionLimits};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -28,11 +30,12 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, Id, JoinError, JoinHandle, JoinSet};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -62,19 +65,40 @@ impl ServerBuilder {
 		self
 	}
 
-	/// The maximum size of an incoming message. Default: 64 MiB.
+	/// The maximum size of an incoming message. Default: 2 MiB.
 	pub fn max_message_size(mut self, size: usize) -> Self {
 		self.transport.max_message_size = Some(size);
+		self.transport.limits.max_message_bytes = size;
+		self
+	}
+
+	/// Configures per-session capacity and deadlines, including the WebSocket message limit.
+	pub fn session_limits(mut self, limits: SessionLimits) -> Self {
+		self.transport.max_message_size = Some(limits.max_message_bytes);
+		self.transport.limits = limits;
+		self
+	}
+
+	/// Shares a process resource budget with other servers and clients.
+	pub fn resource_budget(mut self, budget: ResourceBudget) -> Self {
+		self.transport.budget = budget;
 		self
 	}
 
 	/// Builds the server. Add endpoints, then bind it or mount them in an axum router.
 	pub fn build(self) -> VcmpServer {
-		VcmpServer { inner: Arc::new(ServerInner { config: self, endpoints: RwLock::new(Vec::new()) }) }
+		VcmpServer {
+			inner: Arc::new(ServerInner {
+				config: self,
+				endpoints: RwLock::new(Vec::new()),
+				stopped: AtomicBool::new(false),
+			}),
+		}
 	}
 }
 
 struct ServerInner {
+	stopped: AtomicBool,
 	config: ServerBuilder,
 	endpoints: RwLock<Vec<Endpoint>>,
 }
@@ -146,11 +170,41 @@ impl VcmpServer {
 		let local_addr = listener.local_addr()?;
 		info!(%local_addr, "server listening");
 		let server = self.inner.clone();
+		server.stopped.store(false, Ordering::SeqCst);
+		let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+		let stop_guard = stop.clone();
+		let (progress, connections) =
+			tokio::sync::watch::channel(ConnectionTasks { accepting: true, tasks: HashMap::new() });
 		let accept = tokio::spawn(async move {
+			// Dropping the handle detaches the listener; only an explicit stop ends it.
+			let _stop_guard = stop_guard;
+			let mut connections = JoinSet::new();
 			loop {
-				match listener.accept().await {
+				let accepted = tokio::select! {
+					biased;
+					_ = stop_rx.changed() => break,
+					Some(completed) = connections.join_next_with_id(), if !connections.is_empty() => {
+						progress.send_modify(|state| state.finished(completed));
+						continue;
+					},
+					accepted = listener.accept() => accepted,
+				};
+				match accepted {
 					Ok((stream, remote_addr)) => {
-						tokio::spawn(Self::handle_connection(server.clone(), stream, remote_addr));
+						if let Ok(connection) = server.config.transport.budget.reserve(Resource::Connection, 0) {
+							let server = server.clone();
+							let (ready, registered) = tokio::sync::oneshot::channel();
+							let task = connections.spawn(async move {
+								// A hook may stop its server as soon as it starts, even on another worker.
+								if registered.await.is_ok() {
+									Self::handle_connection(server, stream, remote_addr, connection).await;
+								}
+							});
+							progress.send_modify(|state| {
+								state.tasks.insert(task.id(), task);
+							});
+							let _ = ready.send(());
+						}
 					}
 					Err(error) => {
 						warn!("error accepting connection: {error}");
@@ -158,11 +212,21 @@ impl VcmpServer {
 					}
 				}
 			}
+			drop(listener);
+			progress.send_modify(|state| state.accepting = false);
+			while let Some(completed) = connections.join_next_with_id().await {
+				progress.send_modify(|state| state.finished(completed));
+			}
 		});
-		Ok(ServerHandle { server: self.inner.clone(), local_addr, accept })
+		Ok(ServerHandle { server: self.inner.clone(), local_addr, accept, stop, connections })
 	}
 
-	async fn handle_connection(server: Arc<ServerInner>, stream: TcpStream, remote_addr: SocketAddr) {
+	async fn handle_connection(
+		server: Arc<ServerInner>,
+		stream: TcpStream,
+		remote_addr: SocketAddr,
+		connection: Permit,
+	) {
 		let mut matched: Option<(Endpoint, ConnectInfo)> = None;
 		#[allow(clippy::result_large_err)] // tungstenite's callback signature
 		let callback = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
@@ -182,7 +246,7 @@ impl VcmpServer {
 					Ok(response)
 				}
 				None => {
-					debug!(path, %remote_addr, "no endpoint for path");
+					debug!(%remote_addr, "no endpoint for path");
 					let mut response = ErrorResponse::new(Some("No such endpoint".to_owned()));
 					*response.status_mut() = StatusCode::NOT_FOUND;
 					Err(response)
@@ -190,17 +254,21 @@ impl VcmpServer {
 			}
 		};
 		let config = server.config.transport.websocket_config();
-		let ws = match tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config)).await {
-			Ok(ws) => ws,
-			Err(error) => {
-				debug!(%remote_addr, "handshake failed: {error}");
+		let handshake = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config));
+		let ws = match tokio::time::timeout(server.config.transport.limits.shutdown_timeout, handshake).await {
+			Ok(Ok(ws)) => ws,
+			_ => {
+				debug!(%remote_addr, "handshake failed or timed out");
 				return;
 			}
 		};
+		if server.stopped.load(Ordering::SeqCst) {
+			return;
+		}
 		let Some((endpoint, connect_info)) = matched else {
 			return;
 		};
-		let session = endpoint.start_session(connect_info, ws);
+		let session = endpoint.start_session(connect_info, ws, connection);
 		endpoint.serve_session(session).await;
 	}
 }
@@ -216,6 +284,27 @@ pub struct ServerHandle {
 	server: Arc<ServerInner>,
 	local_addr: SocketAddr,
 	accept: JoinHandle<()>,
+	stop: tokio::sync::watch::Sender<bool>,
+	connections: tokio::sync::watch::Receiver<ConnectionTasks>,
+}
+
+struct ConnectionTasks {
+	accepting: bool,
+	tasks: HashMap<Id, AbortHandle>,
+}
+
+impl ConnectionTasks {
+	fn finished(&mut self, completed: Result<(Id, ()), JoinError>) {
+		let id = match completed {
+			Ok((id, ())) => id,
+			Err(error) => error.id(),
+		};
+		self.tasks.remove(&id);
+	}
+
+	fn finished_except(&self, caller: Id) -> bool {
+		!self.accepting && self.tasks.keys().all(|id| *id == caller)
+	}
 }
 
 impl fmt::Debug for ServerHandle {
@@ -231,10 +320,34 @@ impl ServerHandle {
 	}
 
 	/// Stops accepting connections and closes every session (failing their pending sends).
-	pub async fn stop(self) {
-		self.accept.abort();
-		let _ = self.accept.await;
+	/// When awaited by a disconnect hook, waits for the other connections; the caller's hook
+	/// remains tracked until it returns or reaches its own handler deadline.
+	pub async fn stop(mut self) {
+		let caller = tokio::task::try_id().filter(|id| self.connections.borrow().tasks.contains_key(id));
+		self.server.stopped.store(true, Ordering::SeqCst);
+		self.stop.send_replace(true);
+		let deadline = self
+			.server
+			.config
+			.transport
+			.limits
+			.shutdown_timeout
+			.saturating_add(self.server.config.transport.limits.handler_timeout);
 		VcmpServer { inner: self.server }.close_sessions().await;
+		if let Some(caller) = caller {
+			let others = self.connections.wait_for(|state| state.finished_except(caller));
+			if tokio::time::timeout(deadline, others).await.is_err() {
+				for (id, task) in &self.connections.borrow().tasks {
+					if *id != caller {
+						task.abort();
+					}
+				}
+				let _ = self.connections.wait_for(|state| state.finished_except(caller)).await;
+			}
+		} else if tokio::time::timeout(deadline, &mut self.accept).await.is_err() {
+			self.accept.abort();
+			let _ = self.accept.await;
+		}
 		info!(local_addr = %self.local_addr, "server stopped");
 	}
 }
@@ -258,7 +371,7 @@ impl EndpointInner {
 
 /// Keeps shutdown waiting until an accepted upgrade has registered its session or failed.
 #[cfg(feature = "axum")]
-pub(crate) struct PendingUpgrade(tokio::sync::watch::Sender<usize>);
+pub(crate) struct PendingUpgrade(tokio::sync::watch::Sender<usize>, pub(crate) Option<Permit>);
 
 #[cfg(feature = "axum")]
 impl Drop for PendingUpgrade {
@@ -276,10 +389,11 @@ pub struct Endpoint {
 
 impl Endpoint {
 	#[cfg(feature = "axum")]
-	pub(crate) fn begin_upgrade(&self) -> PendingUpgrade {
+	pub(crate) fn begin_upgrade(&self) -> Result<PendingUpgrade, VcmpError> {
+		let connection = self.inner.config.transport.budget.reserve(Resource::Connection, 0)?;
 		let pending = self.inner.pending_upgrades.clone();
 		pending.send_modify(|count| *count += 1);
-		PendingUpgrade(pending)
+		Ok(PendingUpgrade(pending, Some(connection)))
 	}
 
 	#[cfg(feature = "axum")]
@@ -287,13 +401,22 @@ impl Endpoint {
 		&self.inner.config.transport
 	}
 
-	pub(crate) fn start_session<S>(&self, connect_info: ConnectInfo, ws: WebSocketStream<S>) -> Session
+	pub(crate) fn start_session<S>(
+		&self,
+		connect_info: ConnectInfo,
+		ws: WebSocketStream<S>,
+		connection: Permit,
+	) -> Session
 	where
 		S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 	{
 		let remote_addr = connect_info.remote_addr;
-		let options = SessionOptions { handlers: self.inner.handlers.clone(), connect_info: Some(connect_info) };
-		let session = spawn_session(options, &self.inner.config.transport, ws);
+		let options = SessionOptions {
+			handlers: self.inner.handlers.clone(),
+			connect_info: Some(connect_info),
+			..Default::default()
+		};
+		let session = spawn_session(options, &self.inner.config.transport, ws, connection);
 		info!(session = session.id(), ?remote_addr, path = self.path(), "session connected");
 		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session.id(), session.clone());
 		session.initiate_heartbeat(self.inner.config.heartbeat_interval);
@@ -301,15 +424,25 @@ impl Endpoint {
 	}
 
 	pub(crate) async fn serve_session(&self, session: Session) {
+		let _cleanup = SessionCleanup { endpoint: self.clone(), session: session.clone() };
 		if let Some(hook) = self.inner.hook(&self.inner.on_connected) {
-			hook(session.clone()).await;
+			if let Ok(_permit) = self.inner.config.transport.budget.reserve(Resource::Handler, 0) {
+				tokio::select! {
+					_ = tokio::time::timeout(self.inner.config.transport.limits.handler_timeout, hook(session.clone())) => {},
+					_ = session.closed() => {},
+				}
+			} else {
+				session.close();
+			}
 		}
 		session.closed().await;
 		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id());
 		let remote_addr = session.connect_info().and_then(|info| info.remote_addr);
 		info!(session = session.id(), ?remote_addr, path = self.path(), "session disconnected");
 		if let Some(hook) = self.inner.hook(&self.inner.on_disconnected) {
-			hook(session).await;
+			if let Ok(_permit) = self.inner.config.transport.budget.reserve(Resource::Handler, 0) {
+				let _ = tokio::time::timeout(self.inner.config.transport.limits.handler_timeout, hook(session)).await;
+			}
 		}
 	}
 
@@ -400,11 +533,22 @@ impl Endpoint {
 			.zip(results)
 			.map(|(session, result)| {
 				if let Err(error) = &result {
-					warn!(session = session.id(), "broadcast send failed: {error}");
+					warn!(session = session.id(), status = error.status(), "broadcast send failed");
 				}
 				BroadcastResult { session, result }
 			})
 			.collect()
+	}
+}
+
+struct SessionCleanup {
+	endpoint: Endpoint,
+	session: Session,
+}
+impl Drop for SessionCleanup {
+	fn drop(&mut self) {
+		self.session.close();
+		self.endpoint.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.session.id());
 	}
 }
 

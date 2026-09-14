@@ -9,8 +9,8 @@
 //! - [`Session::send`] registers the pending entry *before* writing the `MSG`, and settles with
 //!   the `ACK` payload or a [`VcmpError`] (the peer's `NAK` problem detail, `503 Session not open`
 //!   when the session is not open at send time, or `503 Session closed` when the session closes
-//!   while the send is outstanding). There is **no library-level acknowledgement timeout**:
-//!   bounding the wait is the caller's job (`tokio::time::timeout(d, session.send(&m))`).
+//!   while the send is outstanding). Requests have a configured acknowledgement timeout:
+//!   requests use the configured deadline and dropping the waiter removes correlation state.
 //! - Incoming `MSG` frames are dispatched by their `@type` to a handler that runs **off the read
 //!   loop**, so long-running handlers never stall acknowledgements or heartbeats.
 //! - Heartbeats: whoever calls [`Session::initiate_heartbeat`] sends `HBT<interval>` and arms a
@@ -19,6 +19,7 @@
 
 use crate::error::VcmpError;
 use crate::frame::Frame;
+use crate::resources::{Permit, Resource, ResourceBudget, ResourceLimits, ResourceSnapshot};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -33,11 +34,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
-use tokio::task::AbortHandle;
-use tracing::{debug, error, trace, warn};
-
-/// How long the driver waits for the outgoing half to flush its close frame before giving up.
-const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+use tokio::task::{AbortHandle, JoinSet};
+use tracing::{debug, trace, warn};
 
 /// A VCMP message type: a JSON object whose `@type` member is [`VcmpMessage::TYPE`].
 ///
@@ -59,7 +57,7 @@ pub trait VcmpMessage: Serialize + DeserializeOwned {
 }
 
 /// Information about how a server-side session was established.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConnectInfo {
 	/// The request path (without query string).
 	pub path: String,
@@ -80,6 +78,15 @@ impl ConnectInfo {
 	/// The value of the first header with the given (case-insensitive) name.
 	pub fn header(&self, name: &str) -> Option<&str> {
 		self.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+	}
+}
+
+impl fmt::Debug for ConnectInfo {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("ConnectInfo")
+			.field("remote_addr", &self.remote_addr)
+			.field("headers", &"[redacted]")
+			.finish_non_exhaustive()
 	}
 }
 
@@ -137,12 +144,17 @@ impl HandlerMap {
 					VcmpError::bad_request("Invalid message")
 						.with_detail(format!("The message could not be deserialized: {error}"))
 				})?;
+				let limit = session.inner.limits.max_message_bytes.saturating_sub(15);
 				let result = handler(message, session).await.map_err(Into::into)?;
-				let value = serde_json::to_value(&result).map_err(|error| {
-					VcmpError::internal("Message handling failed")
-						.with_detail(format!("The handler result could not be serialized: {error}"))
+				let payload = serialize_bounded(&result, limit).map_err(|error| {
+					if error.status() == 413 {
+						error
+					} else {
+						VcmpError::internal("Message handling failed")
+							.with_detail("The handler result could not be serialized.")
+					}
 				})?;
-				Ok(if value.is_null() { None } else { Some(value.to_string()) })
+				Ok(if payload == "null" { None } else { Some(payload) })
 			})
 		});
 		self.handlers.write().unwrap_or_else(|e| e.into_inner()).insert(type_.to_owned(), erased);
@@ -170,6 +182,45 @@ impl fmt::Debug for HandlerMap {
 	}
 }
 
+/// Per-session capacity and lifecycle deadlines. All durations must be nonzero.
+#[derive(Debug, Clone)]
+pub struct SessionLimits {
+	/// Counts and retained wire bytes for this session.
+	pub resources: ResourceLimits,
+	/// Maximum complete incoming or outgoing VCMP frame, including prefix and id.
+	pub max_message_bytes: usize,
+	/// Maximum wait for an acknowledgement. A timeout never authorizes mutation replay.
+	pub request_timeout: Duration,
+	/// Maximum lifetime of a handler or connection hook future.
+	pub handler_timeout: Duration,
+	/// Maximum time a single transport write may block.
+	pub write_timeout: Duration,
+	/// Maximum time to flush a transport close.
+	pub shutdown_timeout: Duration,
+}
+
+impl Default for SessionLimits {
+	fn default() -> Self {
+		Self {
+			resources: ResourceLimits {
+				connections: 1,
+				queued_messages: 128,
+				queued_bytes: 4 << 20,
+				control_messages: 128,
+				control_bytes: 4 << 20,
+				pending_requests: 256,
+				handler_tasks: 128,
+				handler_bytes: 4 << 20,
+			},
+			max_message_bytes: 2 << 20,
+			request_timeout: Duration::from_secs(30),
+			handler_timeout: Duration::from_secs(30),
+			write_timeout: Duration::from_secs(5),
+			shutdown_timeout: Duration::from_secs(5),
+		}
+	}
+}
+
 /// Options for [`Session::spawn`].
 #[derive(Debug, Clone, Default)]
 pub struct SessionOptions {
@@ -177,21 +228,32 @@ pub struct SessionOptions {
 	pub handlers: Arc<HandlerMap>,
 	/// How the session was established (server side).
 	pub connect_info: Option<ConnectInfo>,
+	/// Per-session resource limits and deadlines.
+	pub limits: SessionLimits,
+	/// Shared process budget; clone the same budget into all transports to enforce global limits.
+	pub budget: ResourceBudget,
 }
 
 impl SessionOptions {
 	/// Options with the given handlers and no connect info.
 	pub fn new(handlers: Arc<HandlerMap>) -> Self {
-		SessionOptions { handlers, connect_info: None }
+		SessionOptions { handlers, ..Default::default() }
 	}
 }
 
-enum Outgoing {
-	Text(String),
-	Close,
+struct Outgoing {
+	text: String,
+	_permits: (Permit, Permit),
+}
+
+struct AdmittedSink<K> {
+	// Drop buffered wire payloads before releasing their permits, including when the writer is aborted.
+	sink: K,
+	permits: Option<(Permit, Permit)>,
 }
 
 type PendingSender = oneshot::Sender<Result<Option<String>, VcmpError>>;
+type PendingEntry = (PendingSender, (Permit, Permit));
 
 #[derive(Default)]
 struct HeartbeatState {
@@ -208,15 +270,20 @@ struct Inner {
 	id: u64,
 	handlers: Arc<HandlerMap>,
 	connect_info: Option<ConnectInfo>,
-	out_tx: mpsc::UnboundedSender<Outgoing>,
+	out_tx: mpsc::Sender<Outgoing>,
+	control_tx: mpsc::Sender<Outgoing>,
+	limits: SessionLimits,
+	local: ResourceBudget,
+	budget: ResourceBudget,
 	/// Pending sends by frame id. `open` is checked under this lock in `send`, and cleared before
 	/// the drain in `finish_close`, so no send can slip in between and pend forever.
-	pending: Mutex<HashMap<String, PendingSender>>,
+	pending: Mutex<HashMap<String, PendingEntry>>,
 	open: AtomicBool,
 	closed: watch::Sender<bool>,
 	close_requested: Notify,
 	heartbeat: Mutex<HeartbeatState>,
 	heartbeats_received: AtomicU64,
+	ignored_frames: AtomicU64,
 }
 
 /// A VCMP session: one WebSocket connection with its pending sends and heartbeat state.
@@ -242,7 +309,28 @@ impl Session {
 		K: Sink<String> + Send + Unpin + 'static,
 		K::Error: fmt::Display,
 	{
-		let (out_tx, out_rx) = mpsc::unbounded_channel();
+		Self::try_spawn(options, stream, sink).expect("session connection budget exhausted; use Session::try_spawn")
+	}
+
+	/// Spawns a session, rejecting admission when the shared connection budget is exhausted.
+	pub fn try_spawn<S, K>(options: SessionOptions, stream: S, sink: K) -> Result<Session, VcmpError>
+	where
+		S: Stream<Item = String> + Send + Unpin + 'static,
+		K: Sink<String> + Send + Unpin + 'static,
+		K::Error: fmt::Display,
+	{
+		let connection = options.budget.reserve(Resource::Connection, 0)?;
+		Ok(Self::spawn_admitted(options, stream, sink, connection))
+	}
+
+	pub(crate) fn spawn_admitted<S, K>(options: SessionOptions, stream: S, sink: K, connection: Permit) -> Session
+	where
+		S: Stream<Item = String> + Send + Unpin + 'static,
+		K: Sink<String> + Send + Unpin + 'static,
+		K::Error: fmt::Display,
+	{
+		let (out_tx, out_rx) = mpsc::channel(options.limits.resources.queued_messages.max(1));
+		let (control_tx, control_rx) = mpsc::channel(options.limits.resources.control_messages.max(1));
 		let (closed, _) = watch::channel(false);
 		let session = Session {
 			inner: Arc::new(Inner {
@@ -250,16 +338,36 @@ impl Session {
 				handlers: options.handlers,
 				connect_info: options.connect_info,
 				out_tx,
+				control_tx,
+				local: ResourceBudget::new(options.limits.resources.clone()),
+				limits: options.limits,
+				budget: options.budget,
 				pending: Mutex::new(HashMap::new()),
 				open: AtomicBool::new(true),
 				closed,
 				close_requested: Notify::new(),
 				heartbeat: Mutex::new(HeartbeatState { awaiting: true, ..Default::default() }),
 				heartbeats_received: AtomicU64::new(0),
+				ignored_frames: AtomicU64::new(0),
 			}),
 		};
-		tokio::spawn(session.clone().drive(stream, sink, out_rx));
+		let task_session = session.clone();
+		tokio::spawn(async move {
+			let _connection = connection;
+			task_session.drive(stream, sink, out_rx, control_rx).await;
+		});
 		session
+	}
+
+	/// Current per-session transport resources.
+	pub fn resources(&self) -> ResourceSnapshot {
+		self.inner.local.snapshot()
+	}
+
+	fn reserve(&self, resource: Resource, bytes: usize) -> Result<(Permit, Permit), VcmpError> {
+		let local = self.inner.local.reserve(resource, bytes)?;
+		let global = self.inner.budget.reserve(resource, bytes)?;
+		Ok((local, global))
 	}
 
 	/// A process-unique id of this session.
@@ -282,6 +390,18 @@ impl Session {
 		self.inner.heartbeats_received.load(Ordering::Relaxed)
 	}
 
+	/// Invalid or late frames observed. Diagnostics are coalesced at powers of two.
+	pub fn ignored_frames(&self) -> u64 {
+		self.inner.ignored_frames.load(Ordering::Relaxed)
+	}
+
+	fn diagnose(&self, reason: &'static str) {
+		let count = self.inner.ignored_frames.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+		if count.is_power_of_two() {
+			warn!(session = self.id(), count, reason, "ignored or invalid frames");
+		}
+	}
+
 	/// Resolves once the session has closed and all pending sends have been settled.
 	pub async fn closed(&self) {
 		let mut rx = self.inner.closed.subscribe();
@@ -298,15 +418,12 @@ impl Session {
 	/// with the peer's `NAK` problem detail, `503 Session not open` when the session is not open,
 	/// or `503 Session closed` when the session closes while the send is outstanding.
 	///
-	/// The wait is unbounded by design; use `tokio::time::timeout` around the future if needed.
+	/// The configured request deadline applies. Dropping this future removes retained correlation state.
 	pub async fn send<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
-		let payload = serde_json::to_string(message).map_err(|error| {
-			VcmpError::internal("Invalid message").with_detail(format!("The message could not be serialized: {error}"))
-		})?;
+		let payload = serialize_bounded(message, self.inner.limits.max_message_bytes.saturating_sub(15))?;
 		match self.send_payload(payload).await? {
 			None => Ok(Value::Null),
 			Some(ack) => serde_json::from_str(&ack).map_err(|error| {
-				warn!(session = self.id(), "could not parse ACK payload: {error}");
 				VcmpError::internal("Invalid acknowledgement")
 					.with_detail("The ACK payload could not be parsed.")
 					.with_source(error)
@@ -334,6 +451,10 @@ impl Session {
 	/// useful for tests that need to send malformed messages.
 	#[doc(hidden)]
 	pub async fn send_payload(&self, payload: String) -> Result<Option<String>, VcmpError> {
+		if payload.len().saturating_add(15) > self.inner.limits.max_message_bytes {
+			return Err(VcmpError::new(413, "Message too large"));
+		}
+		let permits = self.reserve(Resource::Request, 0)?;
 		let frame = Frame::message(payload);
 		let id = frame.id().expect("message frames have an id").to_owned();
 		let (tx, rx) = oneshot::channel();
@@ -342,16 +463,17 @@ impl Session {
 			if !self.is_open() {
 				return Err(VcmpError::session_not_open("Cannot send message: the WebSocket is not open."));
 			}
-			// Register before writing: a loopback peer may acknowledge synchronously.
-			pending.insert(id.clone(), tx);
+			pending.insert(id.clone(), (tx, permits));
 		}
-		if !self.write(frame) {
-			self.inner.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-			return Err(VcmpError::session_not_open("Cannot send message: the WebSocket is not open."));
-		}
-		match rx.await {
-			Ok(result) => result,
-			Err(_) => Err(VcmpError::session_closed("The session was closed before the message was acknowledged.")),
+		let _cleanup = PendingCleanup { session: self.clone(), id };
+		self.enqueue(frame.serialize(), false)?;
+		// Only the queued copy owns byte permits; do not retain the original payload while awaiting an ACK.
+		drop(frame);
+		match tokio::time::timeout(self.inner.limits.request_timeout, rx).await {
+			Ok(Ok(result)) => result,
+			Ok(Err(_)) => Err(VcmpError::session_closed("The session closed before acknowledgement.")),
+			Err(_) => Err(VcmpError::new(504, "Acknowledgement timed out")
+				.with_detail("Delivery or mutation outcome is unknown; do not automatically replay.")),
 		}
 	}
 
@@ -367,6 +489,9 @@ impl Session {
 	/// received heartbeat — without this, a peer that completes the handshake but never sends
 	/// anything would go undetected.
 	pub fn expect_heartbeat(&self, timeout: Duration) {
+		if !self.is_open() {
+			return;
+		}
 		let session = self.clone();
 		let watchdog = tokio::spawn(async move {
 			tokio::time::sleep(timeout).await;
@@ -384,7 +509,6 @@ impl Session {
 	pub fn close(&self) {
 		if self.inner.open.swap(false, Ordering::SeqCst) {
 			debug!(session = self.id(), "closing session");
-			let _ = self.inner.out_tx.send(Outgoing::Close);
 			self.inner.close_requested.notify_one();
 		}
 	}
@@ -392,12 +516,32 @@ impl Session {
 	/// Sends a raw text frame. Returns whether the frame was handed to the transport.
 	#[doc(hidden)]
 	pub fn send_raw(&self, raw: String) -> bool {
-		self.is_open() && self.inner.out_tx.send(Outgoing::Text(raw)).is_ok()
+		let control = !raw.starts_with("MSG");
+		self.enqueue(raw, control).is_ok()
+	}
+
+	fn enqueue(&self, text: String, control: bool) -> Result<(), VcmpError> {
+		if !self.is_open() {
+			return Err(VcmpError::session_not_open("The session is not open."));
+		}
+		if text.len() > self.inner.limits.max_message_bytes {
+			return Err(VcmpError::new(413, "Message too large"));
+		}
+		let resource = if control { Resource::Control } else { Resource::Data };
+		let permits = self.reserve(resource, text.len())?;
+		let tx = if control { &self.inner.control_tx } else { &self.inner.out_tx };
+		tx.try_send(Outgoing { text, _permits: permits }).map_err(|_| VcmpError::new(503, "Transport overloaded"))
 	}
 
 	fn write(&self, frame: Frame) -> bool {
-		trace!(session = self.id(), "sending frame {frame}");
-		self.send_raw(frame.serialize())
+		// Frame payloads may contain credentials or customer data; never include them in logs.
+		if self.enqueue(frame.serialize(), true).is_err() {
+			// Dropping a mandatory acknowledgement makes delivery ambiguous. Disconnect instead.
+			self.close();
+			false
+		} else {
+			true
+		}
 	}
 
 	fn send_heartbeat(&self, interval: u64) {
@@ -432,12 +576,12 @@ impl Session {
 
 	fn handle_heartbeat(&self, interval: u64) {
 		if interval == 0 {
-			warn!(session = self.id(), "ignoring heartbeat with invalid interval");
+			self.diagnose("invalid heartbeat interval");
 			return;
 		}
 		let mut state = self.inner.heartbeat.lock().unwrap_or_else(|e| e.into_inner());
 		if !state.awaiting {
-			warn!(session = self.id(), "ignoring unexpected heartbeat");
+			self.diagnose("unexpected heartbeat");
 			return;
 		}
 		state.awaiting = false;
@@ -461,7 +605,7 @@ impl Session {
 		if let Some(tx) = self.take_pending(id) {
 			let _ = tx.send(Ok(payload));
 		} else {
-			debug!(session = self.id(), id, "ignoring ACK for unknown message");
+			self.diagnose("late or unknown ACK");
 		}
 	}
 
@@ -472,7 +616,6 @@ impl Session {
 					VcmpError::internal("Message handling failed").with_detail("Unspecified error in message handling.")
 				}
 				Some(payload) => serde_json::from_str::<VcmpError>(&payload).unwrap_or_else(|error| {
-					warn!(session = self.id(), id, "could not parse NAK payload: {error}");
 					VcmpError::internal("Message handling failed")
 						.with_detail("The NAK payload could not be parsed.")
 						.with_source(error)
@@ -480,22 +623,30 @@ impl Session {
 			};
 			let _ = tx.send(Err(error));
 		} else {
-			debug!(session = self.id(), id, "ignoring NAK for unknown message");
+			self.diagnose("late or unknown NAK");
 		}
 	}
 
 	fn take_pending(&self, id: &str) -> Option<PendingSender> {
-		self.inner.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(id)
+		self.inner.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(id).map(|(sender, _)| sender)
 	}
 
-	fn handle_message(&self, id: String, payload: String) {
+	fn handle_message(&self, id: String, payload: String, tasks: &mut JoinSet<()>) {
+		let permits = match self.reserve(Resource::Handler, payload.len()) {
+			Ok(permits) => permits,
+			Err(error) => {
+				self.nak(&id, &error);
+				return;
+			}
+		};
 		let message: Value = if payload.is_empty() {
 			Value::Object(Default::default())
 		} else {
 			match serde_json::from_str(&payload) {
 				Ok(message) => message,
 				Err(error) => {
-					warn!(session = self.id(), id, "could not parse message payload, sending NAK: {error}");
+					let _ = error;
+					self.diagnose("invalid JSON");
 					self.nak(
 						&id,
 						&VcmpError::bad_request("Invalid message")
@@ -506,7 +657,7 @@ impl Session {
 			}
 		};
 		let Some(type_) = message.get("@type").and_then(Value::as_str).filter(|t| !t.is_empty()) else {
-			error!(session = self.id(), id, "could not determine type of message, sending NAK");
+			self.diagnose("missing message type");
 			self.nak(
 				&id,
 				&VcmpError::bad_request("Invalid message").with_detail("The message does not specify a type."),
@@ -514,28 +665,26 @@ impl Session {
 			return;
 		};
 		let Some(handler) = self.inner.handlers.resolve(type_) else {
-			warn!(session = self.id(), id, type_, "no handler found for message, sending NAK");
 			self.write(Frame::nak(id, None));
 			return;
 		};
 		// Run the handler off the read loop, so the session keeps processing ACKs and heartbeats.
 		let session = self.clone();
-		tokio::spawn(async move {
-			match handler(message, session.clone()).await {
-				Ok(payload) => {
+		tasks.spawn(async move {
+			let _permits = permits;
+			match tokio::time::timeout(session.inner.limits.handler_timeout, handler(message, session.clone())).await {
+				Ok(Ok(payload)) => {
 					session.write(Frame::ack(id, payload));
 				}
-				Err(error) => {
-					debug!(session = session.id(), id, "handler failed, sending NAK: {error}");
-					session.nak(&id, &error);
-				}
+				Ok(Err(error)) => session.nak(&id, &error),
+				Err(_) => session.nak(&id, &VcmpError::new(504, "Handler timed out")),
 			}
 		});
 	}
 
 	fn nak(&self, id: &str, error: &VcmpError) {
 		let payload = serde_json::to_string(error).unwrap_or_else(|serialization_error| {
-			warn!(session = self.id(), "could not serialize handler error: {serialization_error}");
+			let _ = serialization_error;
 			let fallback = VcmpError::internal("Message handling failed")
 				.with_detail("The handler error could not be serialized.");
 			serde_json::to_string(&fallback).expect("a plain problem detail serializes")
@@ -543,74 +692,92 @@ impl Session {
 		self.write(Frame::nak(id, Some(payload)));
 	}
 
-	fn handle_incoming(&self, raw: String) {
+	fn handle_incoming(&self, raw: String, tasks: &mut JoinSet<()>) {
+		if raw.len() > self.inner.limits.max_message_bytes {
+			self.close();
+			return;
+		}
 		let frame = match Frame::parse(&raw) {
 			Ok(frame) => frame,
 			Err(error) => {
-				// Never close the session over an unknown frame; just drop it.
-				warn!(session = self.id(), "ignoring invalid frame: {error}");
+				// Invalid-frame diagnostics do not retain arbitrary peer payloads.
+				let _ = error;
+				self.diagnose("invalid frame");
 				return;
 			}
 		};
-		trace!(session = self.id(), "received frame {frame}");
+		trace!(session = self.id(), bytes = raw.len(), "received frame");
 		match frame {
 			Frame::Heartbeat { interval } => self.handle_heartbeat(interval),
 			Frame::Ack { id, payload } => self.handle_ack(&id, payload),
 			Frame::Nak { id, payload } => self.handle_nak(&id, payload),
-			Frame::Message { id, payload } => self.handle_message(id, payload),
+			Frame::Message { id, payload } => self.handle_message(id, payload, tasks),
 		}
 	}
 
-	async fn drive<S, K>(self, mut stream: S, mut sink: K, mut out_rx: mpsc::UnboundedReceiver<Outgoing>)
-	where
+	async fn drive<S, K>(
+		self,
+		mut stream: S,
+		sink: K,
+		mut out_rx: mpsc::Receiver<Outgoing>,
+		mut control_rx: mpsc::Receiver<Outgoing>,
+	) where
 		S: Stream<Item = String> + Send + Unpin + 'static,
 		K: Sink<String> + Send + Unpin + 'static,
 		K::Error: fmt::Display,
 	{
-		debug!(session = self.id(), "session open");
 		let writer_session = self.clone();
-		// Reading and writing are separate tasks, so a slow write (large message, full socket
-		// buffer) never stalls the processing of incoming frames — and two peers sending large
-		// messages to each other cannot deadlock.
-		let writer = tokio::spawn(async move {
-			while let Some(outgoing) = out_rx.recv().await {
-				match outgoing {
-					Outgoing::Text(text) => {
-						if let Err(error) = sink.send(text).await {
-							warn!(session = writer_session.id(), "error writing to transport, closing: {error}");
-							writer_session.close();
-							break;
-						}
-					}
-					Outgoing::Close => {
-						if let Err(error) = sink.close().await {
-							debug!(session = writer_session.id(), "error closing transport: {error}");
-						}
-						break;
-					}
+		let mut closing = self.inner.closed.subscribe();
+		let mut writer = tokio::spawn(async move {
+			let mut transport = AdmittedSink { sink, permits: None };
+			loop {
+				let outgoing = tokio::select! {
+					biased;
+					_ = closing.changed() => break,
+					outgoing = control_rx.recv() => outgoing,
+					outgoing = out_rx.recv() => outgoing,
+				};
+				let Some(outgoing) = outgoing else {
+					break;
+				};
+				if !writer_session.is_open() {
+					break;
 				}
+				transport.permits = Some(outgoing._permits);
+				let result = tokio::select! {
+					_ = closing.changed() => break,
+					result = tokio::time::timeout(writer_session.inner.limits.write_timeout,
+						transport.sink.send(outgoing.text)) => result,
+				};
+				if !matches!(result, Ok(Ok(()))) {
+					writer_session.close();
+					break;
+				}
+				transport.permits = None;
 			}
+			let _ = tokio::time::timeout(writer_session.inner.limits.shutdown_timeout, transport.sink.close()).await;
 		});
-		let peer_closed = loop {
+		let mut tasks = JoinSet::new();
+		loop {
 			tokio::select! {
+				biased;
+				_ = self.inner.close_requested.notified() => break,
+				_ = tasks.join_next(), if !tasks.is_empty() => {},
 				incoming = stream.next() => match incoming {
-					Some(text) => self.handle_incoming(text),
-					None => {
-						debug!(session = self.id(), "transport closed by peer");
-						break true;
-					}
+					Some(text) => self.handle_incoming(text, &mut tasks),
+					None => break,
 				},
-				_ = self.inner.close_requested.notified() => break false,
 			}
-		};
+		}
 		drop(stream);
 		self.close();
-		if peer_closed {
-			// Nothing can be delivered any more; do not wait for queued writes to fail.
+		tasks.abort_all();
+		while tasks.join_next().await.is_some() {}
+		// Notify writer to stop pending writes; final `closed()` notification follows actual cleanup.
+		self.inner.closed.send_replace(false);
+		if tokio::time::timeout(self.inner.limits.shutdown_timeout, &mut writer).await.is_err() {
 			writer.abort();
-		} else if tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, writer).await.is_err() {
-			// The writer closes the sink and ends on `Outgoing::Close`; give it a bounded time.
-			warn!(session = self.id(), "transport did not close in time");
+			let _ = writer.await;
 		}
 		self.finish_close();
 	}
@@ -630,12 +797,52 @@ impl Session {
 		if !pending.is_empty() {
 			warn!(session = self.id(), count = pending.len(), "failing pending messages: session closed");
 		}
-		for (_, tx) in pending {
+		for (_, (tx, _permits)) in pending {
 			let _ =
 				tx.send(Err(VcmpError::session_closed("The session was closed before the message was acknowledged.")));
 		}
 		debug!(session = self.id(), "session closed");
 		self.inner.closed.send_replace(true);
+	}
+}
+
+fn serialize_bounded<M: Serialize + ?Sized>(message: &M, limit: usize) -> Result<String, VcmpError> {
+	struct Output {
+		bytes: Vec<u8>,
+		limit: usize,
+		full: bool,
+	}
+	impl std::io::Write for Output {
+		fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+			if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+				self.full = true;
+				return Err(std::io::Error::other("message limit exceeded"));
+			}
+			self.bytes.extend_from_slice(bytes);
+			Ok(bytes.len())
+		}
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+	let mut output = Output { bytes: Vec::new(), limit, full: false };
+	if serde_json::to_writer(&mut output, message).is_err() {
+		return Err(if output.full {
+			VcmpError::new(413, "Message too large")
+		} else {
+			VcmpError::internal("Message serialization failed")
+		});
+	}
+	Ok(String::from_utf8(output.bytes).expect("JSON serialization produces UTF-8"))
+}
+
+struct PendingCleanup {
+	session: Session,
+	id: String,
+}
+impl Drop for PendingCleanup {
+	fn drop(&mut self) {
+		self.session.take_pending(&self.id);
 	}
 }
 

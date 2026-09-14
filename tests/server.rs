@@ -18,6 +18,7 @@ server_tests!(
 	server_side_sends_are_handled_by_the_client,
 	max_message_size_rejects_oversized_messages,
 	fragments_outgoing_messages,
+	connection_budget_rejects_overload_then_recovers,
 );
 
 async fn routes_by_path_and_exposes_connect_info(host: ServerHost) {
@@ -464,4 +465,140 @@ async fn axum_close_sessions_during_upgrade(accept: bool) {
 	}
 	wait_until(|| endpoint.session_count() == 0).await;
 	handle.stop().await;
+}
+
+async fn connection_budget_rejects_overload_then_recovers(host: ServerHost) {
+	let budget = vcmp::ResourceBudget::new(vcmp::ResourceLimits { connections: 1, ..Default::default() });
+	let server = VcmpServer::builder().resource_budget(budget.clone()).build();
+	let endpoint = server.endpoint("/bounded");
+	let handle = host.bind(server, 0).await;
+	let url = format!("ws://{}/bounded", handle.local_addr());
+	let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+	wait_until(|| endpoint.session_count() == 1).await;
+	assert!(tokio_tungstenite::connect_async(&url).await.is_err());
+	assert_eq!(budget.snapshot().connections, 1);
+	assert!(budget.snapshot().overloads >= 1);
+	first.close(None).await.unwrap();
+	wait_until(|| budget.snapshot().connections == 0).await;
+	let (mut replacement, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+	replacement.close(None).await.unwrap();
+	handle.stop().await;
+}
+
+#[tokio::test]
+async fn bare_dropping_handle_keeps_listener_running() {
+	let server = VcmpServer::builder().build();
+	server.endpoint("/detached");
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let url = format!("ws://{}/detached", handle.local_addr());
+	drop(handle);
+	let (mut peer, _) = tokio::time::timeout(Duration::from_secs(1), tokio_tungstenite::connect_async(url))
+		.await
+		.expect("the detached listener must keep accepting connections")
+		.expect("dropping the handle must not stop the server");
+	peer.close(None).await.unwrap();
+	server.close_sessions().await;
+}
+
+#[tokio::test]
+async fn bare_slow_handshake_is_bounded_and_shutdown_cannot_create_a_late_session() {
+	let budget = vcmp::ResourceBudget::new(vcmp::ResourceLimits { connections: 1, ..Default::default() });
+	let limits = vcmp::SessionLimits { shutdown_timeout: Duration::from_millis(40), ..Default::default() };
+	let server = VcmpServer::builder().resource_budget(budget.clone()).session_limits(limits).build();
+	let endpoint = server.endpoint("/bounded");
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let _slow = tokio::net::TcpStream::connect(handle.local_addr()).await.unwrap();
+	wait_until(|| budget.snapshot().connections == 1).await;
+	tokio::time::timeout(Duration::from_secs(1), handle.stop()).await.unwrap();
+	assert_eq!(budget.snapshot().connections, 0);
+	assert_eq!(endpoint.session_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_stop_waits_for_disconnect_hooks() {
+	let server = VcmpServer::builder().build();
+	let endpoint = server.endpoint("/shutdown");
+	let release = Arc::new(tokio::sync::Notify::new());
+	let hook_release = release.clone();
+	let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+	endpoint.on_session_disconnected(move |_| {
+		let release = hook_release.clone();
+		let events = events.clone();
+		async move {
+			events.send("started").unwrap();
+			release.notified().await;
+			events.send("finished").unwrap();
+		}
+	});
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let (peer, _) = tokio_tungstenite::connect_async(format!("ws://{}/shutdown", handle.local_addr())).await.unwrap();
+	wait_until(|| endpoint.session_count() == 1).await;
+	let mut stopping = tokio::spawn(handle.stop());
+	assert_eq!(tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some("started"));
+	assert!(tokio::time::timeout(Duration::from_millis(20), &mut stopping).await.is_err());
+	release.notify_one();
+	tokio::time::timeout(Duration::from_secs(2), stopping).await.unwrap().unwrap();
+	assert_eq!(received.recv().await, Some("finished"));
+	drop(peer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_disconnect_hook_stop_waits_for_every_other_hook() {
+	let budget = vcmp::ResourceBudget::default();
+	let limits = vcmp::SessionLimits {
+		handler_timeout: Duration::from_secs(5),
+		shutdown_timeout: Duration::from_millis(200),
+		..Default::default()
+	};
+	let server = VcmpServer::builder().resource_budget(budget.clone()).session_limits(limits).build();
+	let endpoint = server.endpoint("/shutdown/{name}");
+	let handle_slot: Arc<Mutex<Option<vcmp::ServerHandle>>> = Arc::default();
+	let hook_handle = handle_slot.clone();
+	let release_other = Arc::new(tokio::sync::Notify::new());
+	let hook_release_other = release_other.clone();
+	let release_caller = Arc::new(tokio::sync::Notify::new());
+	let hook_release_caller = release_caller.clone();
+	let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+	endpoint.on_session_disconnected(move |session| {
+		let handle_slot = hook_handle.clone();
+		let release_other = hook_release_other.clone();
+		let release_caller = hook_release_caller.clone();
+		let events = events.clone();
+		async move {
+			if session.connect_info().unwrap().param("name") == Some("caller") {
+				let handle = handle_slot.lock().unwrap().take().unwrap();
+				events.send("caller started").unwrap();
+				handle.stop().await;
+				events.send("caller stop returned").unwrap();
+				release_caller.notified().await;
+				events.send("caller finished").unwrap();
+			} else {
+				events.send("other started").unwrap();
+				release_other.notified().await;
+				events.send("other finished").unwrap();
+			}
+		}
+	});
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let addr = handle.local_addr();
+	*handle_slot.lock().unwrap() = Some(handle);
+	let (mut caller, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/shutdown/caller")).await.unwrap();
+	let (other, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/shutdown/other")).await.unwrap();
+	wait_until(|| endpoint.session_count() == 2).await;
+	caller.close(None).await.unwrap();
+	for expected in ["caller started", "other started"] {
+		assert_eq!(tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some(expected));
+	}
+	assert!(tokio::time::timeout(Duration::from_millis(20), received.recv()).await.is_err());
+	release_other.notify_one();
+	for expected in ["other finished", "caller stop returned"] {
+		assert_eq!(tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some(expected));
+	}
+	assert!(tokio::net::TcpStream::connect(addr).await.is_err(), "the listener must be dropped before stop returns");
+	assert_eq!(budget.snapshot().handler_tasks, 1, "the calling hook remains active after stop returns");
+	release_caller.notify_one();
+	assert_eq!(tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some("caller finished"));
+	wait_until(|| budget.snapshot().handler_tasks == 0).await;
+	assert_eq!(budget.snapshot().connections, 0);
+	drop((caller, other));
 }

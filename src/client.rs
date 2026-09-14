@@ -18,8 +18,11 @@
 //! reconnects) otherwise, so a half-open connection never leaves sends pending forever.
 
 use crate::error::VcmpError;
+use crate::resources::Resource;
 use crate::session::{HandlerMap, Session, SessionOptions, VcmpMessage};
 use crate::ws::{TransportOptions, spawn_session};
+use crate::{ResourceBudget, SessionLimits};
+use futures_util::{FutureExt, future::Shared};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -29,7 +32,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tracing::{debug, info, warn};
@@ -87,13 +90,16 @@ impl Default for Backoff {
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type OpenHook = Arc<dyn Fn(Session) -> BoxFuture + Send + Sync>;
+type HeaderFuture = Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, VcmpError>> + Send>>;
+type HeaderFactory = Arc<dyn Fn() -> HeaderFuture + Send + Sync>;
 type CloseHook = Arc<dyn Fn() -> BoxFuture + Send + Sync>;
 
 /// Configures a [`VcmpClient`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientBuilder {
 	url: String,
 	headers: Vec<(String, String)>,
+	headers_per_attempt: Option<HeaderFactory>,
 	backoff: Backoff,
 	initial_heartbeat_timeout: Duration,
 	connect_timeout: Duration,
@@ -104,6 +110,18 @@ impl ClientBuilder {
 	/// Adds a header to the WebSocket handshake request (e.g. `Authorization`).
 	pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
 		self.headers.push((name.into(), value.into()));
+		self
+	}
+
+	/// Generates fresh headers immediately before every handshake, including reconnects.
+	/// The connect deadline and stop cancellation also cover this future. Returned headers replace
+	/// static headers of the same name. Errors are never logged with credential-bearing details.
+	pub fn headers_per_attempt<F, Fut>(mut self, factory: F) -> Self
+	where
+		F: Fn() -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Vec<(String, String)>, VcmpError>> + Send + 'static,
+	{
+		self.headers_per_attempt = Some(Arc::new(move || Box::pin(factory())));
 		self
 	}
 
@@ -135,9 +153,23 @@ impl ClientBuilder {
 		self
 	}
 
-	/// The maximum size of an incoming message. Default: 64 MiB.
+	/// The maximum size of an incoming message. Default: 2 MiB.
 	pub fn max_message_size(mut self, size: usize) -> Self {
 		self.transport.max_message_size = Some(size);
+		self.transport.limits.max_message_bytes = size;
+		self
+	}
+
+	/// Configures per-session capacity and deadlines, including the WebSocket message limit.
+	pub fn session_limits(mut self, limits: SessionLimits) -> Self {
+		self.transport.max_message_size = Some(limits.max_message_bytes);
+		self.transport.limits = limits;
+		self
+	}
+
+	/// Shares a process resource budget with other servers and clients.
+	pub fn resource_budget(mut self, budget: ResourceBudget) -> Self {
+		self.transport.budget = budget;
 		self
 	}
 
@@ -161,9 +193,15 @@ impl ClientBuilder {
 struct ClientState {
 	running: bool,
 	generation: u64,
-	task: Option<JoinHandle<()>>,
+	task: Option<ClientTask>,
 	stop: Option<watch::Sender<Stop>>,
 	session: Option<Session>,
+}
+
+#[derive(Clone)]
+struct ClientTask {
+	abort: AbortHandle,
+	completion: Shared<BoxFuture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +236,7 @@ impl VcmpClient {
 		ClientBuilder {
 			url: url.into(),
 			headers: Vec::new(),
+			headers_per_attempt: None,
 			backoff: Backoff::default(),
 			initial_heartbeat_timeout: Duration::from_secs(60),
 			connect_timeout: Duration::from_secs(30),
@@ -276,23 +315,35 @@ impl VcmpClient {
 	pub fn start(&self) {
 		let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
 		Self::stop_locked(&mut state, Stop::Quiet);
+		if let Some(task) = state.task.take() {
+			task.abort.abort();
+		}
 		state.running = true;
+		self.inner.connected.send_replace(false);
 		state.generation += 1;
 		let generation = state.generation;
 		let (stop_tx, stop_rx) = watch::channel(Stop::No);
 		state.stop = Some(stop_tx);
-		info!(url = self.url(), "starting client");
-		state.task = Some(tokio::spawn(Self::run(self.inner.clone(), generation, stop_rx)));
+		info!("starting client");
+		let task = tokio::spawn(Self::run(self.inner.clone(), generation, stop_rx));
+		state.task = Some(ClientTask { abort: task.abort_handle(), completion: task.map(|_| ()).boxed().shared() });
 	}
 
 	/// Closes the connection, fails pending sends with `503 Session closed` and stops
 	/// reconnecting. In-flight handlers are not awaited.
 	pub fn stop(&self) {
+		self.stop_inner();
+	}
+
+	fn stop_inner(&self) -> Option<ClientTask> {
 		let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
 		if state.running {
-			info!(url = self.url(), "stopping client");
+			info!("stopping client");
 		}
 		Self::stop_locked(&mut state, Stop::Notify);
+		self.inner.connected.send_replace(false);
+		// Retain control in the client even if a shutdown waiter is canceled or another waiter starts.
+		state.task.clone()
 	}
 
 	fn stop_locked(state: &mut ClientState, how: Stop) {
@@ -300,10 +351,28 @@ impl VcmpClient {
 		if let Some(stop) = state.stop.take() {
 			let _ = stop.send(how);
 		}
-		// The run task ends on its own after closing the session; the handle is not awaited so
-		// that stop() stays synchronous, but a leftover task is dropped (not aborted — it must
-		// run its shutdown).
-		state.task.take();
+		if let Some(session) = state.session.take() {
+			session.close();
+		}
+	}
+
+	/// Stops and awaits the connection task and bounded lifecycle hooks.
+	/// Concurrent callers await the same stopped task. Canceling this future leaves that task
+	/// under the client's control; a subsequent `start()` still cancels its old hooks.
+	pub async fn stop_and_wait(&self) {
+		if let Some(mut task) = self.stop_inner() {
+			let deadline = self
+				.inner
+				.config
+				.transport
+				.limits
+				.shutdown_timeout
+				.saturating_add(self.inner.config.transport.limits.handler_timeout);
+			if tokio::time::timeout(deadline, &mut task.completion).await.is_err() {
+				task.abort.abort();
+				task.completion.await;
+			}
+		}
 	}
 
 	/// Whether a session is currently open.
@@ -366,12 +435,23 @@ impl VcmpClient {
 			match connected {
 				Ok(Ok(session)) => {
 					attempt = 0;
-					inner.set_session(generation, Some(session.clone()));
+					let _session_guard = CloseOnDrop(session.clone());
+					if !inner.set_session(generation, Some(session.clone())) {
+						break;
+					}
 					if !inner.config.initial_heartbeat_timeout.is_zero() {
 						session.expect_heartbeat(inner.config.initial_heartbeat_timeout);
 					}
 					if let Some(hook) = inner.open_hook() {
-						hook(session.clone()).await;
+						if let Ok(_permit) = inner.config.transport.budget.reserve(Resource::Handler, 0) {
+							tokio::select! {
+								_ = tokio::time::timeout(inner.config.transport.limits.handler_timeout, hook(session.clone())) => {},
+								_ = stop.changed() => { session.close(); },
+								_ = session.closed() => {},
+							}
+						} else {
+							session.close();
+						}
 					}
 					tokio::select! {
 						_ = session.closed() => {}
@@ -383,49 +463,61 @@ impl VcmpClient {
 					inner.set_session(generation, None);
 					let how = *stop.borrow();
 					if how != Stop::Quiet {
-						debug!(url = inner.config.url, "session closed");
+						debug!("session closed");
 						if let Some(hook) = inner.close_hook() {
-							hook().await;
+							if let Ok(_permit) = inner.config.transport.budget.reserve(Resource::Handler, 0) {
+								let _ =
+									tokio::time::timeout(inner.config.transport.limits.handler_timeout, hook()).await;
+							}
 						}
 					}
 				}
-				Ok(Err(error)) => {
+				Ok(Err(_error)) => {
 					if attempt == 0 {
-						warn!(url = inner.config.url, "failed to connect: {error}");
+						warn!("failed to connect");
 					} else {
-						debug!(url = inner.config.url, attempt, "failed to connect: {error}");
+						debug!(attempt, "failed to connect");
 					}
 				}
-				Err(_) => warn!(url = inner.config.url, "timed out connecting"),
+				Err(_) => warn!("timed out connecting"),
 			}
 			if *stop.borrow() != Stop::No {
 				break;
 			}
 			let delay = inner.config.backoff.delay(attempt);
 			attempt = attempt.saturating_add(1);
-			debug!(url = inner.config.url, ?delay, "scheduling reconnect");
+			debug!(?delay, "scheduling reconnect");
 			tokio::select! {
 				_ = tokio::time::sleep(delay) => {}
 				_ = stop.changed() => break,
 			}
 		}
-		debug!(url = inner.config.url, "client task ended");
+		debug!("client task ended");
 	}
 
 	async fn connect(inner: &Arc<ClientInner>) -> Result<Session, ConnectError> {
 		let config = &inner.config;
+		let connection =
+			config.transport.budget.reserve(Resource::Connection, 0).map_err(|_| ConnectError::Overloaded)?;
 		let mut request = config.url.as_str().into_client_request()?;
 		for (name, value) in &config.headers {
 			let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConnectError::Header(name.clone()))?;
 			let value = HeaderValue::from_str(value).map_err(|_| ConnectError::Header(name.to_string()))?;
 			request.headers_mut().append(name, value);
 		}
-		debug!(url = config.url, "connecting");
+		if let Some(factory) = &config.headers_per_attempt {
+			for (name, value) in factory().await.map_err(|_| ConnectError::Credentials)? {
+				let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConnectError::Header(name))?;
+				let value = HeaderValue::from_str(&value).map_err(|_| ConnectError::Header(name.to_string()))?;
+				request.headers_mut().insert(name, value);
+			}
+		}
+		debug!("connecting");
 		let (ws, _response) =
 			tokio_tungstenite::connect_async_with_config(request, Some(config.transport.websocket_config()), false)
 				.await?;
-		info!(url = config.url, "connected");
-		let session = spawn_session(SessionOptions::new(inner.handlers.clone()), &config.transport, ws);
+		info!("connected");
+		let session = spawn_session(SessionOptions::new(inner.handlers.clone()), &config.transport, ws, connection);
 		Ok(session)
 	}
 }
@@ -440,27 +532,51 @@ impl ClientInner {
 	}
 
 	/// Sets the current session, unless a later `start()` has replaced this generation.
-	fn set_session(&self, generation: u64, session: Option<Session>) {
+	fn set_session(&self, generation: u64, session: Option<Session>) -> bool {
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		if state.generation != generation {
+		if state.generation != generation || (session.is_some() && !state.running) {
 			debug!("ignoring session event of a replaced connection");
-			return;
+			if let Some(session) = session {
+				session.close();
+			}
+			return false;
 		}
 		let connected = session.is_some();
 		state.session = session;
-		drop(state);
 		self.connected.send_replace(connected);
+		true
+	}
+}
+
+struct CloseOnDrop(Session);
+impl Drop for CloseOnDrop {
+	fn drop(&mut self) {
+		self.0.close();
+	}
+}
+
+impl fmt::Debug for ClientBuilder {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("ClientBuilder")
+			.field("url", &"[redacted]")
+			.field("headers", &"[redacted]")
+			.field("transport", &self.transport)
+			.finish_non_exhaustive()
 	}
 }
 
 impl fmt::Debug for VcmpClient {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("VcmpClient").field("url", &self.url()).field("connected", &self.is_connected()).finish()
+		f.debug_struct("VcmpClient").field("url", &"[redacted]").field("connected", &self.is_connected()).finish()
 	}
 }
 
 #[derive(Debug, thiserror::Error)]
 enum ConnectError {
+	#[error("transport overloaded")]
+	Overloaded,
+	#[error("per-attempt credentials unavailable")]
+	Credentials,
 	#[error("invalid header {0:?}")]
 	Header(String),
 	#[error(transparent)]
