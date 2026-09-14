@@ -1,11 +1,13 @@
 //! Capacity, cancellation and lifecycle invariants under slow and non-cooperating peers.
 use futures_channel::mpsc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::pin::Pin;
 use std::sync::{
 	Arc,
-	atomic::{AtomicUsize, Ordering},
+	atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::timeout;
 use vcmp::{Frame, HandlerMap, ResourceBudget, ResourceLimits, Session, SessionLimits, SessionOptions, VcmpError};
@@ -208,6 +210,113 @@ async fn permanently_stalled_writer_is_cancelled_with_all_resources_released() {
 	timeout(Duration::from_secs(1), session.closed()).await.unwrap();
 	assert_eq!(session.resources().queued_bytes, 0);
 	assert_eq!(session.resources().control_bytes, 0);
+}
+
+#[derive(Default)]
+struct BufferedWrite {
+	retained: AtomicUsize,
+	closing: AtomicBool,
+	accounted_on_drop: AtomicUsize,
+}
+
+struct BufferedSink {
+	state: Arc<BufferedWrite>,
+	budget: ResourceBudget,
+	control: bool,
+	payload: Option<String>,
+}
+
+impl Drop for BufferedSink {
+	fn drop(&mut self) {
+		let usage = self.budget.snapshot();
+		let accounted = if self.control { usage.control_bytes } else { usage.queued_bytes };
+		self.state.accounted_on_drop.store(accounted, Ordering::SeqCst);
+		self.payload.take();
+		self.state.retained.store(0, Ordering::SeqCst);
+	}
+}
+
+impl Sink<String> for BufferedSink {
+	type Error = std::convert::Infallible;
+
+	fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn start_send(mut self: Pin<&mut Self>, item: String) -> Result<(), Self::Error> {
+		self.state.retained.store(item.len(), Ordering::SeqCst);
+		self.payload = Some(item);
+		Ok(())
+	}
+
+	fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Pending
+	}
+
+	fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		self.state.closing.store(true, Ordering::SeqCst);
+		Poll::Pending
+	}
+}
+
+async fn buffered_write_keeps_admission_until_dropped(control: bool, cancel: bool) {
+	let raw = if control { "ACK123456789012{}" } else { "MSG123456789012{}" };
+	let budget = ResourceBudget::new(ResourceLimits {
+		queued_messages: 1,
+		queued_bytes: raw.len(),
+		control_messages: 1,
+		control_bytes: raw.len(),
+		..Default::default()
+	});
+	let state = Arc::new(BufferedWrite::default());
+	let mut limits = limits();
+	if cancel {
+		limits.write_timeout = Duration::from_secs(10);
+	}
+	let session = Session::spawn(
+		SessionOptions { budget: budget.clone(), limits, ..Default::default() },
+		futures_util::stream::pending::<String>(),
+		BufferedSink { state: state.clone(), budget: budget.clone(), control, payload: None },
+	);
+	let (other, _peer, mut outgoing) = pair(SessionOptions { budget: budget.clone(), ..Default::default() });
+	assert!(session.send_raw(raw.into()));
+	until(|| state.retained.load(Ordering::SeqCst) == raw.len()).await;
+	if cancel {
+		session.close();
+	}
+	until(|| state.closing.load(Ordering::SeqCst)).await;
+	for usage in [session.resources(), budget.snapshot()] {
+		let (messages, bytes) = if control {
+			(usage.control_messages, usage.control_bytes)
+		} else {
+			(usage.queued_messages, usage.queued_bytes)
+		};
+		assert_eq!((messages, bytes), (1, raw.len()));
+	}
+	assert!(!other.send_raw(raw.into()), "buffered payload must still occupy shared admission");
+	timeout(Duration::from_secs(1), session.closed()).await.unwrap();
+	assert_eq!(state.retained.load(Ordering::SeqCst), 0);
+	assert_eq!(state.accounted_on_drop.load(Ordering::SeqCst), raw.len());
+	assert_eq!(budget.snapshot().queued_bytes, 0);
+	assert_eq!(budget.snapshot().control_bytes, 0);
+	assert!(other.send_raw(raw.into()), "dropping the sink must release admission");
+	assert_eq!(timeout(Duration::from_secs(1), outgoing.next()).await.unwrap().unwrap(), raw);
+	other.close();
+	other.closed().await;
+}
+
+#[tokio::test]
+async fn cancelled_writes_keep_buffered_payloads_accounted_until_shutdown() {
+	for control in [false, true] {
+		buffered_write_keeps_admission_until_dropped(control, true).await;
+	}
+}
+
+#[tokio::test]
+async fn timed_out_writes_keep_buffered_payloads_accounted_until_shutdown() {
+	for control in [false, true] {
+		buffered_write_keeps_admission_until_dropped(control, false).await;
+	}
 }
 
 #[test]

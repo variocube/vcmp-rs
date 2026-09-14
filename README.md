@@ -269,8 +269,12 @@ client.stop_and_wait().await;
 ```
 
 `stop()` signals cancellation synchronously; `stop_and_wait()` additionally awaits the bounded
-client lifecycle. Standalone servers admit a connection before spawning its handshake, time out
+client lifecycle. Concurrent shutdown waiters share completion; canceling a waiter keeps the old
+task under client control so a later `start()` can still cancel its hooks.
+Standalone servers admit a connection before spawning its handshake, time out
 incomplete handshakes, stop accepting before shutdown, and await/cancel their connection tasks.
+When a disconnect hook awaits `ServerHandle::stop()`, shutdown waits for the other connection
+tasks and lets the calling hook finish within its existing handler deadline.
 Axum rejects accepted upgrade admission with HTTP 503 and bounds pending upgrade waits; the host
 must bound **HTTP connections and headers before the VCMP extractor** and stop its listener before
 `close_sessions()`. Hooks have a handler deadline and use the shared handler-task budget. Overload
@@ -282,8 +286,9 @@ Written requests release their serialized payloads before waiting for acknowledg
 correlation state remains pending. Dropping a standalone `ServerHandle` detaches the listener;
 retain the handle and call `stop().await` to shut it down.
 
-Resource snapshots count retained wire bytes and active reservations, including in-flight writes;
-they do not measure allocator overhead, JSON object expansion, kernel buffers or application
+Resource snapshots count retained wire bytes and active reservations, including in-flight writes.
+Canceling a write keeps its reservation until the sink flushes or drops the buffered payload.
+Snapshots do not measure allocator overhead, JSON object expansion, kernel buffers or application
 allocations. Each admitted WebSocket can additionally hold its bounded reassembly buffer. Actual
 RSS, HTTP pre-upgrade resources, a bounded blocking/crypto worker pool and durable business queues
 remain host responsibilities. Handler and hook futures must yield: async cancellation cannot

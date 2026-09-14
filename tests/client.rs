@@ -400,3 +400,122 @@ async fn stop_cancels_pending_credential_generation_and_releases_connection_budg
 	timeout(Duration::from_secs(1), client.stop_and_wait()).await.unwrap();
 	assert_eq!(budget.snapshot().connections, 0);
 }
+
+struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for NotifyOnDrop {
+	fn drop(&mut self) {
+		self.0.notify_one();
+	}
+}
+
+#[tokio::test]
+async fn canceled_stop_wait_keeps_old_close_hook_under_client_control() {
+	restart_cancels_close_hook_while_stopping(true).await;
+}
+
+#[tokio::test]
+async fn restart_cancels_old_close_hook_during_an_active_stop_wait() {
+	restart_cancels_close_hook_while_stopping(false).await;
+}
+
+async fn restart_cancels_close_hook_while_stopping(cancel_wait: bool) {
+	let (server, _) = start_hosted_server(ServerHost::Bare, 0, Duration::from_secs(20)).await;
+	let client = client(&format!("ws://{}/test/a", server.local_addr()));
+	let entered = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	let dropped = Arc::new(tokio::sync::Notify::new());
+	let completed = Arc::new(AtomicUsize::new(0));
+	client.on_close({
+		let entered = entered.clone();
+		let release = release.clone();
+		let dropped = dropped.clone();
+		let completed = completed.clone();
+		move || {
+			let entered = entered.clone();
+			let release = release.clone();
+			let dropped = dropped.clone();
+			let completed = completed.clone();
+			async move {
+				let _guard = NotifyOnDrop(dropped);
+				entered.notify_one();
+				release.notified().await;
+				completed.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+	});
+	client.start();
+	connected(&client).await;
+	let previous = client.session().unwrap();
+	let mut stopped = Some(Box::pin(client.stop_and_wait()));
+	timeout(Duration::from_secs(1), async {
+		tokio::select! {
+			_ = entered.notified() => {},
+			_ = stopped.as_mut().unwrap() => panic!("shutdown returned before its close hook finished"),
+		}
+	})
+	.await
+	.unwrap();
+	if cancel_wait {
+		drop(stopped.take());
+	}
+	client.start();
+	// The previous generation must end even though its callback has not been released.
+	timeout(Duration::from_secs(1), dropped.notified()).await.unwrap();
+	if let Some(stopped) = stopped {
+		timeout(Duration::from_secs(1), stopped).await.unwrap();
+	}
+	connected(&client).await;
+	assert_ne!(client.session().unwrap(), previous);
+	release.notify_one();
+	assert_eq!(completed.load(Ordering::SeqCst), 0);
+	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
+	client.on_close(|| async {});
+	client.stop_and_wait().await;
+	server.stop().await;
+}
+
+#[tokio::test]
+async fn concurrent_stop_waiters_both_wait_for_the_close_hook() {
+	let (server, _) = start_hosted_server(ServerHost::Bare, 0, Duration::from_secs(20)).await;
+	let client = client(&format!("ws://{}/test/a", server.local_addr()));
+	let entered = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	client.on_close({
+		let entered = entered.clone();
+		let release = release.clone();
+		move || {
+			let entered = entered.clone();
+			let release = release.clone();
+			async move {
+				entered.notify_one();
+				release.notified().await;
+			}
+		}
+	});
+	client.start();
+	connected(&client).await;
+	let first = client.stop_and_wait();
+	tokio::pin!(first);
+	timeout(Duration::from_secs(1), async {
+		tokio::select! {
+			_ = entered.notified() => {},
+			_ = &mut first => panic!("shutdown returned before its close hook finished"),
+		}
+	})
+	.await
+	.unwrap();
+	let second = client.stop_and_wait();
+	tokio::pin!(second);
+	std::future::poll_fn(|cx| {
+		use std::future::Future;
+		assert!(first.as_mut().poll(cx).is_pending());
+		assert!(second.as_mut().poll(cx).is_pending(), "every shutdown waiter must await the old task");
+		std::task::Poll::Ready(())
+	})
+	.await;
+	release.notify_one();
+	timeout(Duration::from_secs(1), async { tokio::join!(first, second) }).await.unwrap();
+	assert!(!client.is_connected());
+	server.stop().await;
+}

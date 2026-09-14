@@ -25,7 +25,7 @@ These switches change build artifact size, not transport limits.
 |---|---|
 | `cargo fmt --check` | Passed |
 | `cargo clippy --all-features --all-targets -- -D warnings` | Passed |
-| `cargo test --all-features` | 113 passed; 6 external contract tests separately executed below |
+| `cargo test --all-features` | 122 passed; 6 external contract tests separately executed below |
 | JavaScript contracts, Rust client / bare server / axum server | 3 passed |
 | Java contracts, Rust client / bare server / axum server | 3 passed |
 
@@ -46,6 +46,17 @@ change. HTTP admission before an axum upgrade and blocking application workers a
 The follow-up fixes release the original outgoing payload before awaiting an acknowledgement and
 preserve standalone listener operation when its `ServerHandle` is dropped. The allocation regression
 in `tests/payload_retention.rs` and the detached-listener regression in `tests/server.rs` both fail
-before their respective fixes and pass afterward. All 115 Rust tests pass, along with formatting,
-clippy with warnings denied, default-feature tests and isolated-feature checks.
-The external JS/Java contract results above were recorded before these review corrections.
+before their respective fixes and pass afterward.
+
+Further lifecycle corrections keep canceled or timed-out writes accounted for until the sink drops
+their buffered payloads, preserve client task cancellation across canceled/concurrent shutdown
+waiters, and allow a disconnect hook to await server shutdown without waiting on itself. Seven
+additional tests cover data/control admission through sink teardown, cancellation and replacement
+of client close hooks, concurrent shutdown waiters, and server shutdown waiting for other hooks.
+The buffered-write regressions fail against the previous PR head (`8ce3932`) and pass with the fix.
+
+All 122 Rust tests pass, along with formatting, clippy with warnings denied, default-feature tests,
+isolated-feature checks, and the client/server dependency isolation check. All three JS directions
+and all three Java directions were rerun after these corrections and pass against the same peers
+listed above. The installed Java peer's `vcmp.jar` matches the isolated released-source build by
+SHA-256 (`5a1a6cf113398b4f630750adae7ae4f6df9348325e1601cf625b1674a4ceb241`).

@@ -246,6 +246,12 @@ struct Outgoing {
 	_permits: (Permit, Permit),
 }
 
+struct AdmittedSink<K> {
+	// Drop buffered wire payloads before releasing their permits, including when the writer is aborted.
+	sink: K,
+	permits: Option<(Permit, Permit)>,
+}
+
 type PendingSender = oneshot::Sender<Result<Option<String>, VcmpError>>;
 type PendingEntry = (PendingSender, (Permit, Permit));
 
@@ -712,7 +718,7 @@ impl Session {
 	async fn drive<S, K>(
 		self,
 		mut stream: S,
-		mut sink: K,
+		sink: K,
 		mut out_rx: mpsc::Receiver<Outgoing>,
 		mut control_rx: mpsc::Receiver<Outgoing>,
 	) where
@@ -723,6 +729,7 @@ impl Session {
 		let writer_session = self.clone();
 		let mut closing = self.inner.closed.subscribe();
 		let mut writer = tokio::spawn(async move {
+			let mut transport = AdmittedSink { sink, permits: None };
 			loop {
 				let outgoing = tokio::select! {
 					biased;
@@ -736,17 +743,19 @@ impl Session {
 				if !writer_session.is_open() {
 					break;
 				}
+				transport.permits = Some(outgoing._permits);
 				let result = tokio::select! {
 					_ = closing.changed() => break,
 					result = tokio::time::timeout(writer_session.inner.limits.write_timeout,
-						sink.send(outgoing.text)) => result,
+						transport.sink.send(outgoing.text)) => result,
 				};
 				if !matches!(result, Ok(Ok(()))) {
 					writer_session.close();
 					break;
 				}
+				transport.permits = None;
 			}
-			let _ = tokio::time::timeout(writer_session.inner.limits.shutdown_timeout, sink.close()).await;
+			let _ = tokio::time::timeout(writer_session.inner.limits.shutdown_timeout, transport.sink.close()).await;
 		});
 		let mut tasks = JoinSet::new();
 		loop {

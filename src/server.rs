@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, Id, JoinError, JoinHandle, JoinSet};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -173,6 +173,8 @@ impl VcmpServer {
 		server.stopped.store(false, Ordering::SeqCst);
 		let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
 		let stop_guard = stop.clone();
+		let (progress, connections) =
+			tokio::sync::watch::channel(ConnectionTasks { accepting: true, tasks: HashMap::new() });
 		let accept = tokio::spawn(async move {
 			// Dropping the handle detaches the listener; only an explicit stop ends it.
 			let _stop_guard = stop_guard;
@@ -181,13 +183,27 @@ impl VcmpServer {
 				let accepted = tokio::select! {
 					biased;
 					_ = stop_rx.changed() => break,
-					_ = connections.join_next(), if !connections.is_empty() => continue,
+					Some(completed) = connections.join_next_with_id(), if !connections.is_empty() => {
+						progress.send_modify(|state| state.finished(completed));
+						continue;
+					},
 					accepted = listener.accept() => accepted,
 				};
 				match accepted {
 					Ok((stream, remote_addr)) => {
 						if let Ok(connection) = server.config.transport.budget.reserve(Resource::Connection, 0) {
-							connections.spawn(Self::handle_connection(server.clone(), stream, remote_addr, connection));
+							let server = server.clone();
+							let (ready, registered) = tokio::sync::oneshot::channel();
+							let task = connections.spawn(async move {
+								// A hook may stop its server as soon as it starts, even on another worker.
+								if registered.await.is_ok() {
+									Self::handle_connection(server, stream, remote_addr, connection).await;
+								}
+							});
+							progress.send_modify(|state| {
+								state.tasks.insert(task.id(), task);
+							});
+							let _ = ready.send(());
 						}
 					}
 					Err(error) => {
@@ -196,9 +212,13 @@ impl VcmpServer {
 					}
 				}
 			}
-			while connections.join_next().await.is_some() {}
+			drop(listener);
+			progress.send_modify(|state| state.accepting = false);
+			while let Some(completed) = connections.join_next_with_id().await {
+				progress.send_modify(|state| state.finished(completed));
+			}
 		});
-		Ok(ServerHandle { server: self.inner.clone(), local_addr, accept, stop })
+		Ok(ServerHandle { server: self.inner.clone(), local_addr, accept, stop, connections })
 	}
 
 	async fn handle_connection(
@@ -265,6 +285,26 @@ pub struct ServerHandle {
 	local_addr: SocketAddr,
 	accept: JoinHandle<()>,
 	stop: tokio::sync::watch::Sender<bool>,
+	connections: tokio::sync::watch::Receiver<ConnectionTasks>,
+}
+
+struct ConnectionTasks {
+	accepting: bool,
+	tasks: HashMap<Id, AbortHandle>,
+}
+
+impl ConnectionTasks {
+	fn finished(&mut self, completed: Result<(Id, ()), JoinError>) {
+		let id = match completed {
+			Ok((id, ())) => id,
+			Err(error) => error.id(),
+		};
+		self.tasks.remove(&id);
+	}
+
+	fn finished_except(&self, caller: Id) -> bool {
+		!self.accepting && self.tasks.keys().all(|id| *id == caller)
+	}
 }
 
 impl fmt::Debug for ServerHandle {
@@ -280,7 +320,10 @@ impl ServerHandle {
 	}
 
 	/// Stops accepting connections and closes every session (failing their pending sends).
+	/// When awaited by a disconnect hook, waits for the other connections; the caller's hook
+	/// remains tracked until it returns or reaches its own handler deadline.
 	pub async fn stop(mut self) {
+		let caller = tokio::task::try_id().filter(|id| self.connections.borrow().tasks.contains_key(id));
 		self.server.stopped.store(true, Ordering::SeqCst);
 		self.stop.send_replace(true);
 		let deadline = self
@@ -291,7 +334,17 @@ impl ServerHandle {
 			.shutdown_timeout
 			.saturating_add(self.server.config.transport.limits.handler_timeout);
 		VcmpServer { inner: self.server }.close_sessions().await;
-		if tokio::time::timeout(deadline, &mut self.accept).await.is_err() {
+		if let Some(caller) = caller {
+			let others = self.connections.wait_for(|state| state.finished_except(caller));
+			if tokio::time::timeout(deadline, others).await.is_err() {
+				for (id, task) in &self.connections.borrow().tasks {
+					if *id != caller {
+						task.abort();
+					}
+				}
+				let _ = self.connections.wait_for(|state| state.finished_except(caller)).await;
+			}
+		} else if tokio::time::timeout(deadline, &mut self.accept).await.is_err() {
 			self.accept.abort();
 			let _ = self.accept.await;
 		}

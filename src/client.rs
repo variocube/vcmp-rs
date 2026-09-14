@@ -22,6 +22,7 @@ use crate::resources::Resource;
 use crate::session::{HandlerMap, Session, SessionOptions, VcmpMessage};
 use crate::ws::{TransportOptions, spawn_session};
 use crate::{ResourceBudget, SessionLimits};
+use futures_util::{FutureExt, future::Shared};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -31,7 +32,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tracing::{debug, info, warn};
@@ -192,9 +193,15 @@ impl ClientBuilder {
 struct ClientState {
 	running: bool,
 	generation: u64,
-	task: Option<JoinHandle<()>>,
+	task: Option<ClientTask>,
 	stop: Option<watch::Sender<Stop>>,
 	session: Option<Session>,
+}
+
+#[derive(Clone)]
+struct ClientTask {
+	abort: AbortHandle,
+	completion: Shared<BoxFuture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +316,7 @@ impl VcmpClient {
 		let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
 		Self::stop_locked(&mut state, Stop::Quiet);
 		if let Some(task) = state.task.take() {
-			task.abort();
+			task.abort.abort();
 		}
 		state.running = true;
 		self.inner.connected.send_replace(false);
@@ -318,18 +325,25 @@ impl VcmpClient {
 		let (stop_tx, stop_rx) = watch::channel(Stop::No);
 		state.stop = Some(stop_tx);
 		info!("starting client");
-		state.task = Some(tokio::spawn(Self::run(self.inner.clone(), generation, stop_rx)));
+		let task = tokio::spawn(Self::run(self.inner.clone(), generation, stop_rx));
+		state.task = Some(ClientTask { abort: task.abort_handle(), completion: task.map(|_| ()).boxed().shared() });
 	}
 
 	/// Closes the connection, fails pending sends with `503 Session closed` and stops
 	/// reconnecting. In-flight handlers are not awaited.
 	pub fn stop(&self) {
+		self.stop_inner();
+	}
+
+	fn stop_inner(&self) -> Option<ClientTask> {
 		let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
 		if state.running {
 			info!("stopping client");
 		}
 		Self::stop_locked(&mut state, Stop::Notify);
 		self.inner.connected.send_replace(false);
+		// Retain control in the client even if a shutdown waiter is canceled or another waiter starts.
+		state.task.clone()
 	}
 
 	fn stop_locked(state: &mut ClientState, how: Stop) {
@@ -343,10 +357,10 @@ impl VcmpClient {
 	}
 
 	/// Stops and awaits the connection task and bounded lifecycle hooks.
+	/// Concurrent callers await the same stopped task. Canceling this future leaves that task
+	/// under the client's control; a subsequent `start()` still cancels its old hooks.
 	pub async fn stop_and_wait(&self) {
-		self.stop();
-		let task = self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).task.take();
-		if let Some(mut task) = task {
+		if let Some(mut task) = self.stop_inner() {
 			let deadline = self
 				.inner
 				.config
@@ -354,9 +368,9 @@ impl VcmpClient {
 				.limits
 				.shutdown_timeout
 				.saturating_add(self.inner.config.transport.limits.handler_timeout);
-			if tokio::time::timeout(deadline, &mut task).await.is_err() {
-				task.abort();
-				let _ = task.await;
+			if tokio::time::timeout(deadline, &mut task.completion).await.is_err() {
+				task.abort.abort();
+				task.completion.await;
 			}
 		}
 	}
