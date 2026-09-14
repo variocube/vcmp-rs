@@ -1,6 +1,7 @@
 //! Adapters between `tokio-tungstenite` and the transport-agnostic [`Session`](crate::Session).
 
-use crate::session::{Session, SessionOptions};
+use crate::resources::{Permit, ResourceBudget};
+use crate::session::{Session, SessionLimits, SessionOptions};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use std::fmt;
@@ -10,7 +11,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Transport settings shared by client and server.
 #[derive(Debug, Clone)]
@@ -20,11 +21,18 @@ pub(crate) struct TransportOptions {
 	pub fragment_size: Option<usize>,
 	/// The maximum size of an incoming message.
 	pub max_message_size: Option<usize>,
+	pub limits: SessionLimits,
+	pub budget: ResourceBudget,
 }
 
 impl Default for TransportOptions {
 	fn default() -> Self {
-		TransportOptions { fragment_size: None, max_message_size: Some(64 << 20) }
+		TransportOptions {
+			fragment_size: None,
+			max_message_size: Some(2 << 20),
+			limits: SessionLimits::default(),
+			budget: ResourceBudget::default(),
+		}
 	}
 }
 
@@ -35,12 +43,19 @@ impl TransportOptions {
 }
 
 /// Spawns a [`Session`] over an established WebSocket.
-pub(crate) fn spawn_session<S>(options: SessionOptions, transport: &TransportOptions, ws: WebSocketStream<S>) -> Session
+pub(crate) fn spawn_session<S>(
+	mut options: SessionOptions,
+	transport: &TransportOptions,
+	ws: WebSocketStream<S>,
+	connection: Permit,
+) -> Session
 where
 	S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
 	let (sink, stream) = ws.split();
-	Session::spawn(options, incoming(stream), outgoing(sink, transport.fragment_size))
+	options.limits = transport.limits.clone();
+	options.budget = transport.budget.clone();
+	Session::spawn_admitted(options, incoming(stream), outgoing(sink, transport.fragment_size), connection)
 }
 
 /// Maps the WebSocket stream to VCMP's text frames: text messages pass through, binary frames
@@ -53,12 +68,12 @@ where
 	stream
 		.take_while(|message| {
 			future::ready(match message {
-				Ok(Message::Close(frame)) => {
-					debug!("received close frame: {frame:?}");
+				Ok(Message::Close(_)) => {
+					debug!("received close frame");
 					false
 				}
-				Err(error) => {
-					debug!("transport error: {error}");
+				Err(_) => {
+					debug!("transport error");
 					false
 				}
 				_ => true,
@@ -68,7 +83,7 @@ where
 			future::ready(match message {
 				Ok(Message::Text(text)) => Some(text.to_string()),
 				Ok(Message::Binary(_)) => {
-					warn!("received binary message, which is unsupported");
+					// Unsupported binary frames never enter VCMP queues.
 					None
 				}
 				_ => None,
@@ -84,37 +99,43 @@ fn outgoing<S>(
 where
 	S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-	sink.with_flat_map(move |text: String| {
-		futures_util::stream::iter(messages(text, fragment_size).into_iter().map(Ok))
-	})
+	sink.with_flat_map(move |text: String| futures_util::stream::iter(message_fragments(text, fragment_size).map(Ok)))
 }
 
 /// Splits a text message into WebSocket frames of at most `fragment_size` bytes, preferring
 /// character boundaries. If a character cannot fit, its bytes span multiple frames; WebSocket
 /// text messages need valid UTF-8 only after reassembly.
-fn messages(text: String, fragment_size: Option<usize>) -> Vec<Message> {
-	match fragment_size {
-		Some(size) if size > 0 && text.len() > size => {
-			let mut frames = Vec::with_capacity(text.len().div_ceil(size));
-			let mut start = 0;
-			while start < text.len() {
-				let limit = start + (text.len() - start).min(size);
-				let mut end = limit;
-				while end > start && !text.is_char_boundary(end) {
-					end -= 1;
-				}
-				if end == start {
-					end = limit;
-				}
-				let opcode = OpCode::Data(if start == 0 { Data::Text } else { Data::Continue });
-				let chunk = text.as_bytes()[start..end].to_vec();
-				frames.push(Message::Frame(WsFrame::message(chunk, opcode, end == text.len())));
-				start = end;
-			}
-			frames
+fn message_fragments(mut text: String, fragment_size: Option<usize>) -> impl Iterator<Item = Message> {
+	let mut start = 0;
+	let mut done = false;
+	std::iter::from_fn(move || {
+		if done {
+			return None;
 		}
-		_ => vec![Message::Text(text.into())],
-	}
+		let size = fragment_size.filter(|size| *size > 0).unwrap_or(usize::MAX);
+		if text.len() <= size {
+			done = true;
+			return Some(Message::Text(std::mem::take(&mut text).into()));
+		}
+		let limit = start + (text.len() - start).min(size);
+		let mut end = limit;
+		while end > start && !text.is_char_boundary(end) {
+			end -= 1;
+		}
+		if end == start {
+			end = limit;
+		}
+		let opcode = OpCode::Data(if start == 0 { Data::Text } else { Data::Continue });
+		let chunk = text.as_bytes()[start..end].to_vec();
+		done = end == text.len();
+		start = end;
+		Some(Message::Frame(WsFrame::message(chunk, opcode, done)))
+	})
+}
+
+#[cfg(test)]
+fn messages(text: String, fragment_size: Option<usize>) -> Vec<Message> {
+	message_fragments(text, fragment_size).collect()
 }
 
 /// A displayable wrapper for the header list of a connect info.
@@ -131,7 +152,7 @@ impl Headers<'_> {
 
 impl fmt::Debug for Headers<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_list().entries(self.to_vec()).finish()
+		f.write_str("Headers([redacted])")
 	}
 }
 

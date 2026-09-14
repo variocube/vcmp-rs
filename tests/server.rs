@@ -18,6 +18,7 @@ server_tests!(
 	server_side_sends_are_handled_by_the_client,
 	max_message_size_rejects_oversized_messages,
 	fragments_outgoing_messages,
+	connection_budget_rejects_overload_then_recovers,
 );
 
 async fn routes_by_path_and_exposes_connect_info(host: ServerHost) {
@@ -464,4 +465,36 @@ async fn axum_close_sessions_during_upgrade(accept: bool) {
 	}
 	wait_until(|| endpoint.session_count() == 0).await;
 	handle.stop().await;
+}
+
+async fn connection_budget_rejects_overload_then_recovers(host: ServerHost) {
+	let budget = vcmp::ResourceBudget::new(vcmp::ResourceLimits { connections: 1, ..Default::default() });
+	let server = VcmpServer::builder().resource_budget(budget.clone()).build();
+	let endpoint = server.endpoint("/bounded");
+	let handle = host.bind(server, 0).await;
+	let url = format!("ws://{}/bounded", handle.local_addr());
+	let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+	wait_until(|| endpoint.session_count() == 1).await;
+	assert!(tokio_tungstenite::connect_async(&url).await.is_err());
+	assert_eq!(budget.snapshot().connections, 1);
+	assert!(budget.snapshot().overloads >= 1);
+	first.close(None).await.unwrap();
+	wait_until(|| budget.snapshot().connections == 0).await;
+	let (mut replacement, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+	replacement.close(None).await.unwrap();
+	handle.stop().await;
+}
+
+#[tokio::test]
+async fn bare_slow_handshake_is_bounded_and_shutdown_cannot_create_a_late_session() {
+	let budget = vcmp::ResourceBudget::new(vcmp::ResourceLimits { connections: 1, ..Default::default() });
+	let limits = vcmp::SessionLimits { shutdown_timeout: Duration::from_millis(40), ..Default::default() };
+	let server = VcmpServer::builder().resource_budget(budget.clone()).session_limits(limits).build();
+	let endpoint = server.endpoint("/bounded");
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let _slow = tokio::net::TcpStream::connect(handle.local_addr()).await.unwrap();
+	wait_until(|| budget.snapshot().connections == 1).await;
+	tokio::time::timeout(Duration::from_secs(1), handle.stop()).await.unwrap();
+	assert_eq!(budget.snapshot().connections, 0);
+	assert_eq!(endpoint.session_count(), 0);
 }

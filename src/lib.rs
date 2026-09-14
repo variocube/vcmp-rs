@@ -35,6 +35,7 @@
 
 pub mod error;
 pub mod frame;
+pub mod resources;
 pub mod session;
 
 #[cfg(feature = "axum")]
@@ -48,7 +49,8 @@ mod ws;
 
 pub use error::{ProblemDetail, VcmpError};
 pub use frame::Frame;
-pub use session::{ConnectInfo, HandlerMap, Session, SessionOptions, VcmpMessage};
+pub use resources::{ResourceBudget, ResourceLimits, ResourceSnapshot};
+pub use session::{ConnectInfo, HandlerMap, Session, SessionLimits, SessionOptions, VcmpMessage};
 
 #[cfg(feature = "client")]
 pub use client::{Backoff, ClientBuilder, VcmpClient};

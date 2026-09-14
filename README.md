@@ -30,9 +30,10 @@ Text WebSocket frames. Each frame starts with a 3-letter type:
 | `NAK` | `NAK` + id + optional JSON payload | The peer's handler failed; payload is an RFC 7807-style problem detail (`title`, `status`, `detail`, …). |
 | `HBT` | `HBT` + interval in ms (decimal) | Heartbeat. One side initiates; the receiver echoes after the interval; each side closes the session if no heartbeat arrives within 2 × interval. |
 
-Message ids are 9 random bytes, base64url-encoded (12 chars). There is **no library-level
-acknowledgement timeout** — a send stays pending until the session closes; bounding the wait is the
-caller's decision (`tokio::time::timeout(d, session.send(&m))`).
+Message ids are 9 random bytes, base64url-encoded (12 chars). Requests default to a 30-second
+acknowledgement deadline. A caller can impose a shorter `tokio::time::timeout`; dropping the send
+future releases correlation state immediately. Timeout or disconnect leaves delivery and mutation
+outcome unknown: the library never replays messages automatically.
 
 ## Using it
 
@@ -87,7 +88,7 @@ client.start();                                                       // connect
 let result: serde_json::Value = client.send(&msg).await?;             // Result<Value, VcmpError>
 let typed: Ack = client.send_as::<_, Ack>(&msg).await?;               // deserialized result
 tokio::time::timeout(Duration::from_secs(20), client.send(&msg)).await??;   // caller-side bound
-client.stop();                                                       // fails pending sends with 503
+client.stop_and_wait().await;                                        // fails pending sends and bounds shutdown
 ```
 
 ### Server
@@ -193,6 +194,105 @@ cargo run --example echo-driver -- ws://127.0.0.1:2000/drivers/echo --announce
 Errors: `VcmpError` *is* a `ProblemDetail` (+ an optional source). Any `std::error::Error` converts
 to a `500` with `title` = the error's type name and `detail` = its message; a `503` is a local,
 retryable transport condition (`Session not open` / `Session closed` / `Not connected`).
+
+## Bounded transport and lifecycle
+
+The transport foundation for [controller-rs #2](https://github.com/variocube/controller-rs/issues/2)
+adds `SessionLimits`, `ResourceLimits` and `ResourceBudget`. This code is an unreleased successor
+to released tag `0.2.0` (`a55bde01c122be90412dd453368f52d4047e67fe`); consumers must pin the
+reviewed companion PR commit with `rev`, not assume these APIs are present in `0.2.0`. The
+original checkout was clean at review; no uncommitted source changes were imported.
+
+```rust
+use vcmp::{ResourceBudget, ResourceLimits, SessionLimits, VcmpServer};
+
+let process = ResourceBudget::new(ResourceLimits {
+	connections: 32,
+	queued_bytes: 8 << 20,
+	..Default::default()
+});
+let server = VcmpServer::builder()
+	.resource_budget(process.clone())
+	.session_limits(SessionLimits::default())
+	.build();
+// Also pass process.clone() to every ClientBuilder in the same application.
+let usage = process.snapshot();
+```
+
+| Limit | Per session default | Shared budget default |
+|---|---:|---:|
+| Connections and handshake attempts | One connection per session | 128 |
+| Application frames queued or writing | 128 / 4 MiB | 1,024 / 16 MiB |
+| Reserved ACK/NAK/heartbeat queue | 128 / 4 MiB | 1,024 / 8 MiB |
+| Pending requests | 256 | 1,024 |
+| Inbound handlers | 128 / 4 MiB wire payload | 256 / 16 MiB wire payload |
+| Complete incoming/outgoing VCMP message | 2 MiB | Per-session maximum |
+
+A builder shares its default budget across its endpoints or connection attempts. A directly
+constructed `SessionOptions::default()` creates an independent budget. Reuse one explicit
+`ResourceBudget` across all clients/servers/sessions for process admission. `Session::try_spawn`
+returns `503 Transport overloaded` on exhausted connection admission; the compatibility `spawn`
+wrapper panics on failed admission. `Session::resources()` reports local queue/request/handler
+usage; connection admission is reported by the shared budget. Zero capacity denies admission;
+channel storage uses at least one slot internally but cannot bypass that admission rule.
+
+Requests and handlers default to 30-second deadlines, individual writes and close flushing to
+five seconds. `session_limits` configures them; use positive durations. Oversized sends fail with
+413 before queueing, and serialization stops growing its output at the message bound. Oversized
+incoming frames disconnect. Queue/request admission returns 503 immediately. Handler admission
+sends a 503 NAK; if a mandatory ACK/NAK/heartbeat cannot enter its reserved queue, the connection
+closes. No business history is silently retained or dropped: callers own durable delivery,
+reconciliation and resnapshot policies. Handler timeout is also an ambiguous mutation outcome.
+
+The writer prioritizes control frames between application writes. The reader continues handling
+ACKs and heartbeats while a transport write or handler is blocked. One already-started write
+cannot be preempted by a heartbeat; the write/watchdog deadline disconnects an unresponsive peer.
+Outgoing fragmentation is generated incrementally, avoiding a vector proportional to fragment
+count. Each session owns and reaps its handler tasks; close aborts and joins them, aborts its
+writer on deadline, drains queues and settles pending requests before `closed()` resolves. Session
+ids identify connection generations. Replacing a client connection cancels its old hook/task and
+closes its session; old completions cannot install or clear the replacement session.
+
+`headers_per_attempt` generates synthetic or real credentials inside the connection deadline,
+once for each attempt, replacing static headers with the same name:
+
+```rust
+let client = vcmp::VcmpClient::builder("wss://example.invalid/controller")
+	.resource_budget(process.clone())
+	.headers_per_attempt(|| async {
+		// Generate a fresh proof using application-owned signing and bounded blocking workers.
+		Ok(vec![("Authorization".to_owned(), "fresh-proof".to_owned())])
+	})
+	.build();
+client.start();
+client.stop_and_wait().await;
+```
+
+`stop()` signals cancellation synchronously; `stop_and_wait()` additionally awaits the bounded
+client lifecycle. Standalone servers admit a connection before spawning its handshake, time out
+incomplete handshakes, stop accepting before shutdown, and await/cancel their connection tasks.
+Axum rejects accepted upgrade admission with HTTP 503 and bounds pending upgrade waits; the host
+must bound **HTTP connections and headers before the VCMP extractor** and stop its listener before
+`close_sessions()`. Hooks have a handler deadline and use the shared handler-task budget. Overload
+closes a session whose open hook cannot run; close hooks are best effort under overload and must
+not be the only owner of required durable cleanup. Axum close hooks finish asynchronously within
+the configured deadline, as in the existing integration contract.
+
+Resource snapshots count retained wire bytes and active reservations, including in-flight writes;
+they do not measure allocator overhead, JSON object expansion, kernel buffers or application
+allocations. Each admitted WebSocket can additionally hold its bounded reassembly buffer. Actual
+RSS, HTTP pre-upgrade resources, a bounded blocking/crypto worker pool and durable business queues
+remain host responsibilities. Handler and hook futures must yield: async cancellation cannot
+interrupt blocking code or undo a mutation already dispatched to another service. Do not spawn
+untracked work from these callbacks. Routine transport logs exclude payloads, URLs and credentials;
+`Debug` output redacts connection headers, paths/parameters and client URLs.
+
+Executable coverage is in `tests/bounds.rs` (counts/bytes, non-ACKing peers, drop/deadline cleanup,
+control priority, stalled writes, oversized frames and old-handler cancellation), `tests/client.rs`
+(fresh credentials, cancellation and replacement), and `tests/server.rs` (bare/axum admission,
+slow handshakes and shutdown). The existing codec/property/socket and JS/Java contract suites
+continue to check the deployed wire format. Application authorization and durable replay/recovery
+are intentionally outside this protocol crate.
 
 ## Building
 

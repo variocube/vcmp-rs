@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use vcmp::{Backoff, VcmpClient};
 
@@ -307,4 +308,95 @@ async fn send_without_session_fails_with_not_connected() {
 	let client = VcmpClient::builder("ws://127.0.0.1:1/").build();
 	let error = client.send(&Void {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
+}
+
+#[tokio::test]
+async fn reconnect_generates_new_credentials_for_each_attempt() {
+	let server = vcmp::VcmpServer::builder().build();
+	let endpoint = server.endpoint("/fresh");
+	let (headers, mut received) = tokio::sync::mpsc::channel(4);
+	endpoint.on_session_connected(move |session| {
+		let headers = headers.clone();
+		async move {
+			headers.send(session.connect_info().unwrap().header("authorization").unwrap().to_owned()).await.unwrap();
+		}
+	});
+	let handle = server.bind("127.0.0.1:0").await.unwrap();
+	let attempts = Arc::new(AtomicUsize::new(0));
+	let client = VcmpClient::builder(format!("ws://{}/fresh", handle.local_addr()))
+		.header("authorization", "stale")
+		.headers_per_attempt({
+			let attempts = attempts.clone();
+			move || {
+				let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+				async move { Ok(vec![("authorization".into(), format!("fresh-{attempt}"))]) }
+			}
+		})
+		.reconnect(Backoff::fixed(Duration::from_millis(10)))
+		.build();
+	client.start();
+	assert_eq!(received.recv().await.unwrap(), "fresh-0");
+	endpoint.sessions()[0].close();
+	assert_eq!(timeout(Duration::from_secs(2), received.recv()).await.unwrap().unwrap(), "fresh-1");
+	client.stop_and_wait().await;
+	handle.stop().await;
+}
+
+#[tokio::test]
+async fn stop_cancels_an_open_hook_and_replacement_cancels_old_handlers() {
+	let (server, endpoint) = start_hosted_server(ServerHost::Bare, 0, Duration::from_secs(20)).await;
+	let client = client(&format!("ws://{}/test/a", server.local_addr()));
+	let old_work = Arc::new(AtomicUsize::new(0));
+	let release = Arc::new(tokio::sync::Notify::new());
+	client.on::<Never, _, _, (), vcmp::VcmpError>({
+		let old_work = old_work.clone();
+		let release = release.clone();
+		move |_, _| {
+			let old_work = old_work.clone();
+			let release = release.clone();
+			async move {
+				release.notified().await;
+				old_work.fetch_add(1, Ordering::SeqCst);
+				Ok(())
+			}
+		}
+	});
+	client.on_open(|_| std::future::pending());
+	client.start();
+	connected(&client).await;
+	let old_session = client.session().unwrap();
+	wait_until(|| endpoint.session_count() == 1).await;
+	let peer = endpoint.sessions()[0].clone();
+	let send = tokio::spawn(async move { peer.send(&Never {}).await });
+	wait_until(|| old_session.resources().handler_tasks == 1).await;
+	client.start();
+	wait_until(|| client.session().is_some_and(|session| session.id() != old_session.id())).await;
+	old_session.closed().await;
+	release.notify_waiters();
+	assert!(send.await.unwrap().is_err());
+	assert_eq!(old_work.load(Ordering::SeqCst), 0);
+	timeout(Duration::from_secs(1), client.stop_and_wait()).await.unwrap();
+	assert!(!client.is_connected());
+	server.stop().await;
+}
+
+#[tokio::test]
+async fn stop_cancels_pending_credential_generation_and_releases_connection_budget() {
+	let budget = vcmp::ResourceBudget::default();
+	let started = Arc::new(AtomicUsize::new(0));
+	let client = VcmpClient::builder("ws://127.0.0.1:1/secret?token=secret")
+		.resource_budget(budget.clone())
+		.headers_per_attempt({
+			let started = started.clone();
+			move || {
+				started.fetch_add(1, Ordering::SeqCst);
+				std::future::pending()
+			}
+		})
+		.build();
+	assert!(!format!("{client:?}").contains("secret"));
+	client.start();
+	wait_until(|| started.load(Ordering::SeqCst) == 1).await;
+	timeout(Duration::from_secs(1), client.stop_and_wait()).await.unwrap();
+	assert_eq!(budget.snapshot().connections, 0);
 }
