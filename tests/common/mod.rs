@@ -11,7 +11,6 @@ use std::time::Duration;
 use vcmp::{Backoff, Endpoint, VcmpClient, VcmpError, VcmpMessage, VcmpServer};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-#[serde(tag = "@type", rename = "test:Echo")]
 pub struct Echo {
 	pub payload: String,
 }
@@ -21,7 +20,6 @@ impl VcmpMessage for Echo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "test:Void")]
 pub struct Void {}
 
 impl VcmpMessage for Void {
@@ -29,7 +27,6 @@ impl VcmpMessage for Void {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "test:Fail")]
 pub struct Fail {
 	pub status: u16,
 	pub title: String,
@@ -42,28 +39,28 @@ impl VcmpMessage for Fail {
 
 /// A message whose handler never acknowledges.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "test:Never")]
 pub struct Never {}
 
 impl VcmpMessage for Never {
 	const TYPE: &'static str = "test:Never";
 }
 
+/// A message no peer registers a handler for.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "test:Unknown")]
 pub struct Unknown {}
+
+impl VcmpMessage for Unknown {
+	const TYPE: &'static str = "test:Unknown";
+}
 
 /// Registers the standard test handlers (echo, void, fail, never) on a client or endpoint.
 pub fn register(handlers: &vcmp::HandlerMap) {
-	handlers.on::<Echo, _, _, _, _>(|echo, _| async move { Ok::<_, VcmpError>(echo.payload) });
-	handlers.on::<Void, _, _, _, _>(|_, _| async { Ok::<(), VcmpError>(()) });
-	handlers.on::<Fail, _, _, _, _>(|fail, _| async move {
+	handlers.on(|echo: Echo, _| async move { Ok(echo.payload) });
+	handlers.on(|_: Void, _| async { Ok(()) });
+	handlers.on(|fail: Fail, _| async move {
 		Err::<(), _>(VcmpError::new(fail.status, fail.title).with_detail(fail.detail))
 	});
-	handlers.on::<Never, _, _, _, _>(|_, _| async {
-		std::future::pending::<()>().await;
-		Ok::<(), VcmpError>(())
-	});
+	handlers.on(|_: Never, _| std::future::pending::<Result<(), VcmpError>>());
 }
 
 pub fn init_tracing() {

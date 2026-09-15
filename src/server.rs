@@ -8,8 +8,8 @@
 //! ```ignore
 //! let server = VcmpServer::builder().heartbeat_interval(Duration::from_secs(20)).build();
 //! let drivers = server.endpoint("/drivers/{driver}");
-//! drivers.on::<DeviceAdded, _, _, _, _>(|msg, session| async move { Ok::<_, VcmpError>(()) });
-//! drivers.on_session_connected(|session| async move {
+//! drivers.on(|msg: DeviceAdded, _session: Session| async move { Ok(()) });
+//! drivers.on_connected(|session| async move {
 //!     tracing::info!(driver = session.connect_info().unwrap().param("driver"), "driver connected");
 //! });
 //! let handle = server.bind("0.0.0.0:2000").await?;
@@ -452,28 +452,26 @@ impl Endpoint {
 	}
 
 	/// Registers the handler for messages of type `M`. See [`HandlerMap::on`].
-	pub fn on<M, F, Fut, R, E>(&self, handler: F) -> &Self
+	pub fn on<M, F, Fut, R>(&self, handler: F) -> &Self
 	where
 		M: VcmpMessage + Send + 'static,
 		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
-		Fut: Future<Output = Result<R, E>> + Send + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
 		R: Serialize,
-		E: Into<VcmpError>,
 	{
-		self.inner.handlers.on::<M, F, Fut, R, E>(handler);
+		self.inner.handlers.on(handler);
 		self
 	}
 
 	/// Registers the handler for messages with the given `@type`. See [`HandlerMap::on_type`].
-	pub fn on_type<M, F, Fut, R, E>(&self, type_: &str, handler: F) -> &Self
+	pub fn on_type<M, F, Fut, R>(&self, type_: &str, handler: F) -> &Self
 	where
 		M: DeserializeOwned + Send + 'static,
 		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
-		Fut: Future<Output = Result<R, E>> + Send + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
 		R: Serialize,
-		E: Into<VcmpError>,
 	{
-		self.inner.handlers.on_type::<M, F, Fut, R, E>(type_, handler);
+		self.inner.handlers.on_type(type_, handler);
 		self
 	}
 
@@ -489,7 +487,7 @@ impl Endpoint {
 	}
 
 	/// Sets the hook that runs when a session connected (after the heartbeat was initiated).
-	pub fn on_session_connected<F, Fut>(&self, hook: F) -> &Self
+	pub fn on_connected<F, Fut>(&self, hook: F) -> &Self
 	where
 		F: Fn(Session) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
@@ -500,7 +498,7 @@ impl Endpoint {
 	}
 
 	/// Sets the hook that runs when a session disconnected (after it was removed from the set).
-	pub fn on_session_disconnected<F, Fut>(&self, hook: F) -> &Self
+	pub fn on_disconnected<F, Fut>(&self, hook: F) -> &Self
 	where
 		F: Fn(Session) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
@@ -524,7 +522,7 @@ impl Endpoint {
 	///
 	/// Never fails as a whole: the result carries one entry per session with that session's
 	/// `ACK` payload or error (a `NAK`, or the session closing mid-broadcast).
-	pub async fn broadcast<M: Serialize + ?Sized>(&self, message: &M) -> Vec<BroadcastResult> {
+	pub async fn broadcast<M: VcmpMessage>(&self, message: &M) -> Vec<BroadcastResult> {
 		let sessions = self.sessions();
 		let sends = sessions.iter().map(|session| session.send(message));
 		let results = futures_util::future::join_all(sends).await;

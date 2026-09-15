@@ -203,6 +203,33 @@ impl VcmpError {
 	}
 }
 
+/// Converts the error of a `Result` into a [`VcmpError`] with a chosen status and title.
+///
+/// Rust has no blanket `From<E: Error>` for `VcmpError`, so `?` on a foreign error inside a
+/// handler does not compile on its own. This gives it a status and title, keeping the error's
+/// message as `detail` and the error itself as the source:
+///
+/// ```ignore
+/// use vcmp::ResultExt;
+///
+/// async fn open_lock(open: OpenLock, _session: Session) -> Result<(), VcmpError> {
+///     port.write_all(&command).await.or_problem(503, "Lock unreachable")?;
+///     Ok(())
+/// }
+/// ```
+///
+/// For a plain `500` with the error's type name as title, use `.map_err(VcmpError::from_error)?`.
+pub trait ResultExt<T> {
+	/// Maps the error to a problem detail with the given status and title.
+	fn or_problem(self, status: u16, title: impl Into<String>) -> Result<T, VcmpError>;
+}
+
+impl<T, E: StdError + Send + Sync + 'static> ResultExt<T> for Result<T, E> {
+	fn or_problem(self, status: u16, title: impl Into<String>) -> Result<T, VcmpError> {
+		self.map_err(|error| VcmpError::new(status, title).with_detail(error.to_string()).with_source(error))
+	}
+}
+
 fn short_type_name<T: ?Sized>() -> &'static str {
 	let name = std::any::type_name::<T>();
 	// Strip generic arguments first, then take the last path segment.
@@ -311,6 +338,16 @@ impl From<std::convert::Infallible> for VcmpError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn or_problem_maps_foreign_errors() {
+		let result: Result<i32, _> = "x".parse::<i32>();
+		let error = result.or_problem(503, "Lock unreachable").unwrap_err();
+		assert_eq!((error.status(), error.title()), (503, "Lock unreachable"));
+		assert_eq!(error.detail(), Some("invalid digit found in string"));
+		assert!(StdError::source(&error).is_some());
+		assert_eq!(Ok::<i32, std::num::ParseIntError>(1).or_problem(500, "unused").unwrap(), 1);
+	}
 
 	#[test]
 	fn serializes_like_the_reference_implementations() {

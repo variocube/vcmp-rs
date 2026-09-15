@@ -37,14 +37,15 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::{debug, trace, warn};
 
-/// A VCMP message type: a JSON object whose `@type` member is [`VcmpMessage::TYPE`].
+/// A VCMP message type: a JSON object dispatched by the `@type` member [`VcmpMessage::TYPE`].
 ///
-/// The `@type` member is what the peer dispatches on, so the type must be part of the serialized
-/// form. The idiomatic way is serde's internally tagged representation:
+/// The library owns the `@type` member: [`Session::send`] adds it when serializing and
+/// [`HandlerMap::on`] removes it before deserializing, so a message type is a plain serde struct
+/// and its `TYPE` is the single place the tag is declared. The struct must serialize as a JSON
+/// object (a struct with named fields, or a map).
 ///
 /// ```ignore
 /// #[derive(Serialize, Deserialize)]
-/// #[serde(tag = "@type", rename = "device:DeviceAdded")]
 /// struct DeviceAdded { id: String }
 ///
 /// impl VcmpMessage for DeviceAdded {
@@ -110,42 +111,67 @@ impl HandlerMap {
 
 	/// Registers the handler for messages of type `M`, replacing any previous one.
 	///
-	/// The handler receives the deserialized message and the session it arrived on. Its `Ok`
+	/// A handler is any `async fn(M, Session) -> Result<R, VcmpError>` or closure of that shape.
+	/// The `@type` member is removed before the message is deserialized into `M`. The `Ok`
 	/// result is serialized as the `ACK` payload (a `()` / `null` result yields an `ACK` without
-	/// payload); its error is converted into a [`VcmpError`] and sent as the `NAK` payload.
-	pub fn on<M, F, Fut, R, E>(&self, handler: F)
+	/// payload); the error is sent as the `NAK` payload. Convert foreign errors with
+	/// [`ResultExt::or_problem`](crate::ResultExt::or_problem) or [`VcmpError::from_error`].
+	///
+	/// ```ignore
+	/// async fn open_lock(open: OpenLock, _session: Session) -> Result<(), VcmpError> {
+	///     hardware.open(&open.id).await.or_problem(503, "Lock unreachable")?;
+	///     Ok(())
+	/// }
+	/// handlers.on(open_lock);
+	/// // or inline, with the message type on the closure parameter:
+	/// handlers.on(|open: OpenLock, session| async move { Ok(()) });
+	/// ```
+	pub fn on<M, F, Fut, R>(&self, handler: F)
 	where
 		M: VcmpMessage + Send + 'static,
 		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
-		Fut: Future<Output = Result<R, E>> + Send + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
 		R: Serialize,
-		E: Into<VcmpError>,
 	{
-		self.on_type::<M, F, Fut, R, E>(M::TYPE, handler);
+		self.register(M::TYPE, true, handler);
 	}
 
 	/// Registers the handler for messages with the given `@type`, replacing any previous one.
 	///
 	/// Like [`HandlerMap::on`] for message types that do not implement [`VcmpMessage`], such as
-	/// [`serde_json::Value`].
-	pub fn on_type<M, F, Fut, R, E>(&self, type_: &str, handler: F)
+	/// [`serde_json::Value`]. The message is deserialized as received, including its `@type`.
+	pub fn on_type<M, F, Fut, R>(&self, type_: &str, handler: F)
 	where
 		M: DeserializeOwned + Send + 'static,
 		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
-		Fut: Future<Output = Result<R, E>> + Send + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
 		R: Serialize,
-		E: Into<VcmpError>,
+	{
+		self.register(type_, false, handler);
+	}
+
+	fn register<M, F, Fut, R>(&self, type_: &str, strip_type: bool, handler: F)
+	where
+		M: DeserializeOwned + Send + 'static,
+		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
+		R: Serialize,
 	{
 		let handler = Arc::new(handler);
-		let erased: Handler = Arc::new(move |value, session| {
+		let erased: Handler = Arc::new(move |mut value, session| {
 			let handler = handler.clone();
 			Box::pin(async move {
+				if strip_type {
+					if let Value::Object(object) = &mut value {
+						object.remove("@type");
+					}
+				}
 				let message: M = serde_json::from_value(value).map_err(|error| {
 					VcmpError::bad_request("Invalid message")
 						.with_detail(format!("The message could not be deserialized: {error}"))
 				})?;
 				let limit = session.inner.limits.max_message_bytes.saturating_sub(15);
-				let result = handler(message, session).await.map_err(Into::into)?;
+				let result = handler(message, session).await?;
 				let payload = serialize_bounded(&result, limit).map_err(|error| {
 					if error.status() == 413 {
 						error
@@ -414,12 +440,35 @@ impl Session {
 
 	/// Sends a message and waits for the peer's acknowledgement.
 	///
-	/// Resolves with the parsed `ACK` payload ([`Value::Null`] when the `ACK` had none), or fails
-	/// with the peer's `NAK` problem detail, `503 Session not open` when the session is not open,
-	/// or `503 Session closed` when the session closes while the send is outstanding.
+	/// The `@type` member is added from [`VcmpMessage::TYPE`]. Resolves with the parsed `ACK`
+	/// payload ([`Value::Null`] when the `ACK` had none), or fails with the peer's `NAK` problem
+	/// detail, `503 Session not open` when the session is not open, or `503 Session closed` when
+	/// the session closes while the send is outstanding.
 	///
 	/// The configured request deadline applies. Dropping this future removes retained correlation state.
-	pub async fn send<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
+	pub async fn send<M: VcmpMessage>(&self, message: &M) -> Result<Value, VcmpError> {
+		self.send_value(&Tagged { type_: M::TYPE, message }).await
+	}
+
+	/// Like [`Session::send`], deserializing the `ACK` payload into `R`.
+	pub async fn send_as<M, R>(&self, message: &M) -> Result<R, VcmpError>
+	where
+		M: VcmpMessage,
+		R: DeserializeOwned,
+	{
+		let value = self.send(message).await?;
+		serde_json::from_value(value).map_err(|error| {
+			VcmpError::internal("Invalid acknowledgement")
+				.with_detail(format!("The ACK payload could not be deserialized: {error}"))
+				.with_source(error)
+		})
+	}
+
+	/// Sends any serializable value as the message payload and waits for the acknowledgement.
+	///
+	/// Unlike [`Session::send`], nothing is added: the value must carry its own `@type` member
+	/// for the peer to dispatch it. Meant for untyped messages such as [`serde_json::Value`].
+	pub async fn send_value<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
 		let payload = serialize_bounded(message, self.inner.limits.max_message_bytes.saturating_sub(15))?;
 		match self.send_payload(payload).await? {
 			None => Ok(Value::Null),
@@ -429,20 +478,6 @@ impl Session {
 					.with_source(error)
 			}),
 		}
-	}
-
-	/// Like [`Session::send`], deserializing the `ACK` payload into `R`.
-	pub async fn send_as<M, R>(&self, message: &M) -> Result<R, VcmpError>
-	where
-		M: Serialize + ?Sized,
-		R: DeserializeOwned,
-	{
-		let value = self.send(message).await?;
-		serde_json::from_value(value).map_err(|error| {
-			VcmpError::internal("Invalid acknowledgement")
-				.with_detail(format!("The ACK payload could not be deserialized: {error}"))
-				.with_source(error)
-		})
 	}
 
 	/// Sends a `MSG` frame with the given raw payload and waits for the acknowledgement.
@@ -808,6 +843,15 @@ impl Session {
 		debug!(session = self.id(), "session closed");
 		self.inner.closed.send_replace(true);
 	}
+}
+
+/// A message with its `@type` member, as sent on the wire.
+#[derive(Serialize)]
+struct Tagged<'a, M: Serialize> {
+	#[serde(rename = "@type")]
+	type_: &'static str,
+	#[serde(flatten)]
+	message: &'a M,
 }
 
 fn serialize_bounded<M: Serialize + ?Sized>(message: &M, limit: usize) -> Result<String, VcmpError> {

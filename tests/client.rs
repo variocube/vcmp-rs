@@ -204,25 +204,32 @@ async fn reconnects_after_a_server_restart(host: ServerHost) {
 	let client = client(&format!("ws://127.0.0.1:{port}/test/a"));
 	let opens = Arc::new(AtomicUsize::new(0));
 	let closes = Arc::new(AtomicUsize::new(0));
-	let (o, c) = (opens.clone(), closes.clone());
-	client.on_open(move |_| {
+	let closed_sessions: Arc<std::sync::Mutex<Vec<vcmp::Session>>> = Arc::default();
+	let (o, c, cs) = (opens.clone(), closes.clone(), closed_sessions.clone());
+	client.on_connected(move |_| {
 		let o = o.clone();
 		async move {
 			o.fetch_add(1, Ordering::SeqCst);
 		}
 	});
-	client.on_close(move || {
+	client.on_disconnected(move |session| {
 		let c = c.clone();
+		let cs = cs.clone();
 		async move {
+			assert!(!session.is_open());
+			cs.lock().unwrap().push(session);
 			c.fetch_add(1, Ordering::SeqCst);
 		}
 	});
 	client.start();
 	connected(&client).await;
+	let first_session = client.session().unwrap();
 	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
 
 	server.stop().await;
 	disconnected(&client).await;
+	wait_until(|| closes.load(Ordering::SeqCst) == 1).await;
+	assert_eq!(closed_sessions.lock().unwrap().as_slice(), &[first_session]);
 	let error = client.send(&Void {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
 
@@ -315,7 +322,7 @@ async fn reconnect_generates_new_credentials_for_each_attempt() {
 	let server = vcmp::VcmpServer::builder().build();
 	let endpoint = server.endpoint("/fresh");
 	let (headers, mut received) = tokio::sync::mpsc::channel(4);
-	endpoint.on_session_connected(move |session| {
+	endpoint.on_connected(move |session| {
 		let headers = headers.clone();
 		async move {
 			headers.send(session.connect_info().unwrap().header("authorization").unwrap().to_owned()).await.unwrap();
@@ -348,10 +355,10 @@ async fn stop_cancels_an_open_hook_and_replacement_cancels_old_handlers() {
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	let old_work = Arc::new(AtomicUsize::new(0));
 	let release = Arc::new(tokio::sync::Notify::new());
-	client.on::<Never, _, _, (), vcmp::VcmpError>({
+	client.on({
 		let old_work = old_work.clone();
 		let release = release.clone();
-		move |_, _| {
+		move |_: Never, _| {
 			let old_work = old_work.clone();
 			let release = release.clone();
 			async move {
@@ -361,7 +368,7 @@ async fn stop_cancels_an_open_hook_and_replacement_cancels_old_handlers() {
 			}
 		}
 	});
-	client.on_open(|_| std::future::pending());
+	client.on_connected(|_| std::future::pending());
 	client.start();
 	connected(&client).await;
 	let old_session = client.session().unwrap();
@@ -426,12 +433,12 @@ async fn restart_cancels_close_hook_while_stopping(cancel_wait: bool) {
 	let release = Arc::new(tokio::sync::Notify::new());
 	let dropped = Arc::new(tokio::sync::Notify::new());
 	let completed = Arc::new(AtomicUsize::new(0));
-	client.on_close({
+	client.on_disconnected({
 		let entered = entered.clone();
 		let release = release.clone();
 		let dropped = dropped.clone();
 		let completed = completed.clone();
-		move || {
+		move |_| {
 			let entered = entered.clone();
 			let release = release.clone();
 			let dropped = dropped.clone();
@@ -470,7 +477,7 @@ async fn restart_cancels_close_hook_while_stopping(cancel_wait: bool) {
 	release.notify_one();
 	assert_eq!(completed.load(Ordering::SeqCst), 0);
 	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
-	client.on_close(|| async {});
+	client.on_disconnected(|_| async {});
 	client.stop_and_wait().await;
 	server.stop().await;
 }
@@ -481,10 +488,10 @@ async fn concurrent_stop_waiters_both_wait_for_the_close_hook() {
 	let client = client(&format!("ws://{}/test/a", server.local_addr()));
 	let entered = Arc::new(tokio::sync::Notify::new());
 	let release = Arc::new(tokio::sync::Notify::new());
-	client.on_close({
+	client.on_disconnected({
 		let entered = entered.clone();
 		let release = release.clone();
-		move || {
+		move |_| {
 			let entered = entered.clone();
 			let release = release.clone();
 			async move {

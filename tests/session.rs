@@ -14,7 +14,6 @@ use tokio::time::timeout;
 use vcmp::{Frame, HandlerMap, Session, SessionOptions, VcmpError, VcmpMessage};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "@type", rename = "test:Ping")]
 struct Ping {
 	text: String,
 }
@@ -24,7 +23,6 @@ impl VcmpMessage for Ping {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "test:Void")]
 struct Void {}
 
 impl VcmpMessage for Void {
@@ -32,7 +30,6 @@ impl VcmpMessage for Void {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "test:Fail")]
 struct Fail {
 	status: u16,
 }
@@ -84,9 +81,9 @@ fn loopback(handlers: Arc<HandlerMap>) -> (Session, Peer) {
 
 fn handlers() -> Arc<HandlerMap> {
 	let handlers = HandlerMap::new();
-	handlers.on::<Ping, _, _, _, _>(|ping, _session| async move { Ok::<_, VcmpError>(format!("pong:{}", ping.text)) });
-	handlers.on::<Void, _, _, _, _>(|_, _| async { Ok::<(), VcmpError>(()) });
-	handlers.on::<Fail, _, _, _, _>(|fail, _| async move {
+	handlers.on(|ping: Ping, _session| async move { Ok(format!("pong:{}", ping.text)) });
+	handlers.on(|_: Void, _| async { Ok(()) });
+	handlers.on(|fail: Fail, _| async move {
 		Err::<(), _>(VcmpError::new(fail.status, "Failed").with_detail("as requested"))
 	});
 	Arc::new(handlers)
@@ -100,6 +97,53 @@ async fn send_resolves_with_the_ack_payload() {
 	assert_eq!(serde_json::from_str::<Ping>(&payload).unwrap(), Ping { text: "hi".into() });
 	peer.inject(&format!("ACK{id}{{\"ok\":true}}"));
 	assert_eq!(send.await.unwrap().unwrap(), serde_json::json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn send_adds_the_type_member_first() {
+	let (session, mut peer) = loopback(handlers());
+	let send = tokio::spawn(async move { session.send(&Ping { text: "hi".into() }).await });
+	let Frame::Message { id, payload } = peer.next_frame().await else { panic!("expected MSG") };
+	assert_eq!(payload, r#"{"@type":"test:Ping","text":"hi"}"#);
+	peer.inject(&format!("ACK{id}"));
+	send.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn send_value_sends_the_value_as_is() {
+	let (session, mut peer) = loopback(handlers());
+	let send = tokio::spawn(async move { session.send_value(&serde_json::json!({"@type": "raw", "n": 1})).await });
+	let Frame::Message { id, payload } = peer.next_frame().await else { panic!("expected MSG") };
+	assert_eq!(payload, r#"{"@type":"raw","n":1}"#);
+	peer.inject(&format!("ACK{id}"));
+	send.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn on_removes_the_type_member_before_deserializing() {
+	#[derive(Deserialize, Serialize)]
+	#[serde(deny_unknown_fields)]
+	struct Strict {
+		text: String,
+	}
+	impl VcmpMessage for Strict {
+		const TYPE: &'static str = "test:Strict";
+	}
+	let handlers = HandlerMap::new();
+	handlers.on(|strict: Strict, _| async move { Ok(strict.text) });
+	let (_session, mut peer) = loopback(Arc::new(handlers));
+	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Strict","text":"x"}"#);
+	assert_eq!(peer.next_frame().await, Frame::ack("abcdefghijkl", Some("\"x\"".into())));
+}
+
+#[tokio::test]
+async fn on_type_keeps_the_type_member() {
+	let handlers = HandlerMap::new();
+	handlers.on_type("test:Raw", |raw: serde_json::Value, _| async move { Ok(raw) });
+	let (_session, mut peer) = loopback(Arc::new(handlers));
+	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Raw","n":1}"#);
+	let Frame::Ack { payload, .. } = peer.next_frame().await else { panic!("expected ACK") };
+	assert_eq!(serde_json::from_str::<serde_json::Value>(&payload.unwrap()).unwrap()["@type"], "test:Raw");
 }
 
 #[tokio::test]
@@ -290,10 +334,10 @@ async fn naks_without_payload_when_no_handler_is_registered() {
 #[tokio::test]
 async fn naks_500_when_the_result_cannot_be_serialized() {
 	let handlers = HandlerMap::new();
-	handlers.on::<Void, _, _, _, _>(|_, _| async {
+	handlers.on(|_: Void, _| async {
 		let mut map = std::collections::HashMap::new();
 		map.insert(vec![1u8], 1u8); // non-string keys cannot be serialized to JSON
-		Ok::<_, VcmpError>(map)
+		Ok(map)
 	});
 	let (_session, mut peer) = loopback(Arc::new(handlers));
 	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Void"}"#);
@@ -306,9 +350,9 @@ async fn naks_500_when_the_result_cannot_be_serialized() {
 #[tokio::test]
 async fn handlers_run_off_the_read_loop() {
 	let handlers = HandlerMap::new();
-	handlers.on::<Void, _, _, _, _>(|_, _| async {
+	handlers.on(|_: Void, _| async {
 		tokio::time::sleep(Duration::from_secs(3600)).await;
-		Ok::<(), VcmpError>(())
+		Ok(())
 	});
 	let (session, mut peer) = loopback(Arc::new(handlers));
 	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Void"}"#);
@@ -324,9 +368,9 @@ async fn handlers_run_off_the_read_loop() {
 #[tokio::test]
 async fn handlers_can_send_on_the_session() {
 	let handlers = HandlerMap::new();
-	handlers.on::<Ping, _, _, _, _>(|ping, session| async move {
+	handlers.on(|ping: Ping, session| async move {
 		session.send(&Ping { text: format!("re:{}", ping.text) }).await?;
-		Ok::<(), VcmpError>(())
+		Ok(())
 	});
 	let (_session, mut peer) = loopback(Arc::new(handlers));
 	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Ping","text":"x"}"#);
@@ -460,9 +504,9 @@ async fn close_is_idempotent_and_settles_everything() {
 	let counter = Arc::new(AtomicUsize::new(0));
 	let handlers = HandlerMap::new();
 	let c = counter.clone();
-	handlers.on::<Void, _, _, _, _>(move |_, _| {
+	handlers.on(move |_: Void, _| {
 		c.fetch_add(1, Ordering::SeqCst);
-		async { Ok::<(), VcmpError>(()) }
+		async { Ok(()) }
 	});
 	let (session, mut peer) = loopback(Arc::new(handlers));
 	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Void"}"#);

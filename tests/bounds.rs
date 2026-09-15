@@ -50,7 +50,7 @@ async fn dropped_and_timed_out_waiters_release_correlation_without_replay() {
 		pair(SessionOptions { limits: limits(), budget: budget.clone(), ..Default::default() });
 	let task = tokio::spawn({
 		let session = session.clone();
-		async move { session.send(&json!({"@type": "mutate"})).await }
+		async move { session.send_value(&json!({"@type": "mutate"})).await }
 	});
 	let Frame::Message { id, .. } = frame(&mut outgoing).await else { panic!("MSG expected") };
 	assert_eq!(session.resources().pending_requests, 1);
@@ -59,7 +59,7 @@ async fn dropped_and_timed_out_waiters_release_correlation_without_replay() {
 	assert_eq!(session.resources().pending_requests, 0);
 	assert_eq!(budget.snapshot().pending_requests, 0);
 	peer.unbounded_send(Frame::ack(id, None).serialize()).unwrap();
-	let error = session.send(&json!({"@type": "mutate"})).await.unwrap_err();
+	let error = session.send_value(&json!({"@type": "mutate"})).await.unwrap_err();
 	assert_eq!(error.status(), 504);
 	assert_eq!(session.resources().pending_requests, 0);
 	assert!(matches!(frame(&mut outgoing).await, Frame::Message { .. }));
@@ -75,10 +75,10 @@ async fn shared_pending_request_limit_is_enforced_across_sessions() {
 	let (second, _other_peer, _) = pair(SessionOptions { budget: budget.clone(), ..Default::default() });
 	let task = tokio::spawn({
 		let first = first.clone();
-		async move { first.send(&json!({})).await }
+		async move { first.send_value(&json!({})).await }
 	});
 	frame(&mut outgoing).await;
-	assert_eq!(second.send(&json!({})).await.unwrap_err().status(), 503);
+	assert_eq!(second.send_value(&json!({})).await.unwrap_err().status(), 503);
 	assert_eq!(budget.snapshot().pending_requests, 1);
 	assert_eq!(budget.snapshot().overloads, 1);
 	task.abort();
@@ -117,13 +117,13 @@ impl Drop for CountDrop {
 async fn overloaded_handlers_nak_while_heartbeats_progress_and_close_aborts_old_work() {
 	let dropped = Arc::new(AtomicUsize::new(0));
 	let handlers = Arc::new(HandlerMap::new());
-	handlers.on_type::<Value, _, _, (), VcmpError>("wait", {
+	handlers.on_type("wait", {
 		let dropped = dropped.clone();
-		move |_, _| {
+		move |_: Value, _| {
 			let dropped = dropped.clone();
 			async move {
 				let _guard = CountDrop(dropped);
-				std::future::pending().await
+				std::future::pending::<Result<(), VcmpError>>().await
 			}
 		}
 	});
@@ -149,7 +149,7 @@ async fn overloaded_handlers_nak_while_heartbeats_progress_and_close_aborts_old_
 #[tokio::test]
 async fn handler_deadline_releases_task_and_returns_504() {
 	let handlers = Arc::new(HandlerMap::new());
-	handlers.on_type::<Value, _, _, (), VcmpError>("wait", |_, _| std::future::pending());
+	handlers.on_type("wait", |_: Value, _| std::future::pending::<Result<(), VcmpError>>());
 	let (session, peer, mut outgoing) = pair(SessionOptions { handlers, limits: limits(), ..Default::default() });
 	peer.unbounded_send(Frame::message(r#"{"@type":"wait"}"#).serialize()).unwrap();
 	let Frame::Nak { payload: Some(payload), .. } = frame(&mut outgoing).await else { panic!("NAK expected") };
@@ -163,7 +163,7 @@ async fn handler_deadline_releases_task_and_returns_504() {
 async fn message_limit_rejects_serialization_and_disconnects_oversized_peer() {
 	let limits = SessionLimits { max_message_bytes: 64, ..limits() };
 	let (session, peer, _) = pair(SessionOptions { limits, ..Default::default() });
-	assert_eq!(session.send(&"x".repeat(100_000)).await.unwrap_err().status(), 413);
+	assert_eq!(session.send_value(&"x".repeat(100_000)).await.unwrap_err().status(), 413);
 	assert_eq!(session.resources().pending_requests, 0);
 	peer.unbounded_send("x".repeat(65)).unwrap();
 	timeout(Duration::from_secs(1), session.closed()).await.unwrap();

@@ -21,7 +21,6 @@ use vcmp::{Backoff, Endpoint, ProblemDetail, Session, VcmpClient, VcmpError, Vcm
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-#[serde(tag = "@type", rename = "contract:Echo")]
 pub struct Echo {
 	pub payload: String,
 }
@@ -31,7 +30,6 @@ impl VcmpMessage for Echo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "contract:Void")]
 pub struct Void {}
 
 impl VcmpMessage for Void {
@@ -39,7 +37,6 @@ impl VcmpMessage for Void {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "contract:Fail")]
 pub struct Fail {
 	pub status: u16,
 	pub title: String,
@@ -51,7 +48,6 @@ impl VcmpMessage for Fail {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "contract:Never")]
 pub struct Never {}
 
 impl VcmpMessage for Never {
@@ -59,12 +55,14 @@ impl VcmpMessage for Never {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "contract:Unknown")]
 pub struct Unknown {}
+
+impl VcmpMessage for Unknown {
+	const TYPE: &'static str = "contract:Unknown";
+}
 
 /// Asks the peer to perform a scenario against us and report the outcome.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "contract:Run")]
 pub struct Run {
 	pub scenario: String,
 	#[serde(flatten)]
@@ -85,15 +83,12 @@ pub struct Outcome {
 }
 
 pub fn register(handlers: &vcmp::HandlerMap) {
-	handlers.on::<Echo, _, _, _, _>(|echo, _| async move { Ok::<_, VcmpError>(echo.payload) });
-	handlers.on::<Void, _, _, _, _>(|_, _| async { Ok::<(), VcmpError>(()) });
-	handlers.on::<Fail, _, _, _, _>(|fail, _| async move {
+	handlers.on(|echo: Echo, _| async move { Ok(echo.payload) });
+	handlers.on(|_: Void, _| async { Ok(()) });
+	handlers.on(|fail: Fail, _| async move {
 		Err::<(), _>(VcmpError::new(fail.status, fail.title).with_detail(fail.detail))
 	});
-	handlers.on::<Never, _, _, _, _>(|_, _| async {
-		std::future::pending::<()>().await;
-		Ok::<(), VcmpError>(())
-	});
+	handlers.on(|_: Never, _| std::future::pending::<Result<(), VcmpError>>());
 }
 
 pub fn init_tracing() {

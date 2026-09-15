@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{net::SocketAddr, time::Duration};
 use tower_http::services::ServeDir;
 use tracing::info;
-use vcmp::{VcmpError, VcmpServer};
+use vcmp::VcmpServer;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
@@ -22,16 +22,16 @@ async fn main() -> std::io::Result<()> {
 
 	let server = VcmpServer::builder().heartbeat_interval(Duration::from_secs(20)).build();
 	let drivers = server.endpoint("/drivers/{driver}");
-	drivers.on_type::<Value, _, _, _, _>("echo", |message, _| async move { Ok::<_, VcmpError>(message) });
-	drivers.on_type::<Value, _, _, _, _>("device:DeviceAdded", |device, session| async move {
+	drivers.on_type("echo", |message: Value, _| async move { Ok(message) });
+	drivers.on_type("device:DeviceAdded", |device: Value, session| async move {
 		info!(session = session.id(), %device, "device added");
-		Ok::<(), VcmpError>(())
+		Ok(())
 	});
-	drivers.on_session_connected(|session| async move {
+	drivers.on_connected(|session| async move {
 		let info = session.connect_info().cloned().unwrap_or_default();
 		info!(session = session.id(), path = info.path, driver = info.param("driver"), "session connected");
 	});
-	drivers.on_session_disconnected(|session| async move {
+	drivers.on_disconnected(|session| async move {
 		info!(session = session.id(), "session disconnected");
 	});
 
