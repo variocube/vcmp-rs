@@ -10,7 +10,18 @@
 use serde_json::Value;
 use std::time::Duration;
 use tracing::info;
-use vcmp::{VcmpError, VcmpServer};
+use vcmp::{Session, VcmpError, VcmpServer};
+
+/// Acknowledges an `echo` message with the message itself.
+async fn echo(message: Value, _session: Session) -> Result<Value, VcmpError> {
+	Ok(message)
+}
+
+/// Logs and acknowledges a `device:DeviceAdded` without a typed model of it.
+async fn device_added(device: Value, session: Session) -> Result<(), VcmpError> {
+	info!(session = session.id(), %device, "device added");
+	Ok(())
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
@@ -20,16 +31,13 @@ async fn main() -> std::io::Result<()> {
 
 	let server = VcmpServer::builder().heartbeat_interval(Duration::from_secs(20)).build();
 	for endpoint in [server.endpoint("/drivers/{driver}"), server.endpoint("/echo")] {
-		endpoint.on_type::<Value, _, _, _, _>("echo", |message, _| async move { Ok::<_, VcmpError>(message) });
-		endpoint.on_type::<Value, _, _, _, _>("device:DeviceAdded", |device, session| async move {
-			info!(session = session.id(), %device, "device added");
-			Ok::<(), VcmpError>(())
-		});
-		endpoint.on_session_connected(|session| async move {
+		endpoint.on_type("echo", echo);
+		endpoint.on_type("device:DeviceAdded", device_added);
+		endpoint.on_connected(|session| async move {
 			let info = session.connect_info().cloned().unwrap_or_default();
 			info!(session = session.id(), path = info.path, driver = info.param("driver"), "session connected");
 		});
-		endpoint.on_session_disconnected(|session| async move {
+		endpoint.on_disconnected(|session| async move {
 			info!(session = session.id(), "session disconnected");
 		});
 	}

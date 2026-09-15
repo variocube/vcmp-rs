@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
-use vcmp::{ConnectInfo, Frame, VcmpClient, VcmpError, VcmpServer};
+use vcmp::{ConnectInfo, Frame, VcmpClient, VcmpError, VcmpMessage, VcmpServer};
 
 server_tests!(
 	routes_by_path_and_exposes_connect_info,
@@ -27,11 +27,11 @@ async fn routes_by_path_and_exposes_connect_info(host: ServerHost) {
 	let drivers = server.endpoint("/drivers/{driver}");
 	let keypad = server.endpoint("/keypad");
 	register(drivers.handlers());
-	keypad.on::<Echo, _, _, _, _>(|_, _| async { Ok::<_, VcmpError>("keypad") });
+	keypad.on(|_: Echo, _| async { Ok("keypad") });
 
 	let infos: Arc<Mutex<Vec<ConnectInfo>>> = Arc::default();
 	let connected_infos = infos.clone();
-	drivers.on_session_connected(move |session| {
+	drivers.on_connected(move |session| {
 		let infos = connected_infos.clone();
 		async move {
 			infos.lock().unwrap().push(session.connect_info().unwrap().clone());
@@ -39,7 +39,7 @@ async fn routes_by_path_and_exposes_connect_info(host: ServerHost) {
 	});
 	let disconnected = Arc::new(Mutex::new(0));
 	let d = disconnected.clone();
-	drivers.on_session_disconnected(move |_| {
+	drivers.on_disconnected(move |_| {
 		let d = d.clone();
 		async move {
 			*d.lock().unwrap() += 1;
@@ -82,7 +82,7 @@ async fn broadcasts_and_reports_per_session_results(host: ServerHost) {
 	let ok = client(&format!("ws://{}/test/ok", server.local_addr()));
 	let failing = VcmpClient::builder(format!("ws://{}/test/failing", server.local_addr())).build();
 	register(failing.handlers());
-	failing.on::<Echo, _, _, _, _>(|_, _| async { Err::<(), _>(VcmpError::new(409, "Conflict")) });
+	failing.on(|_: Echo, _| async { Err::<(), _>(VcmpError::new(409, "Conflict")) });
 	ok.start();
 	failing.start();
 	connected(&ok).await;
@@ -233,7 +233,7 @@ async fn fragments_outgoing_messages(host: ServerHost) {
 	.await
 	.unwrap();
 	let payload = "ä水🦀".repeat(256);
-	let message = Frame::message(serde_json::to_string(&Echo { payload: payload.clone() }).unwrap());
+	let message = Frame::message(serde_json::json!({"@type": Echo::TYPE, "payload": payload}).to_string());
 	peer.send(Message::Text(message.serialize().into())).await.unwrap();
 	let reply = tokio::time::timeout(Duration::from_secs(5), async {
 		loop {
@@ -407,7 +407,7 @@ async fn axum_close_sessions_during_upgrade(accept: bool) {
 	let server = VcmpServer::builder().build();
 	let endpoint = server.endpoint("/test/{name}");
 	let (sessions_tx, mut sessions_rx) = mpsc::unbounded_channel();
-	endpoint.on_session_connected(move |session| {
+	endpoint.on_connected(move |session| {
 		let sessions_tx = sessions_tx.clone();
 		async move {
 			sessions_tx.send(session.clone()).unwrap();
@@ -521,7 +521,7 @@ async fn bare_stop_waits_for_disconnect_hooks() {
 	let release = Arc::new(tokio::sync::Notify::new());
 	let hook_release = release.clone();
 	let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-	endpoint.on_session_disconnected(move |_| {
+	endpoint.on_disconnected(move |_| {
 		let release = hook_release.clone();
 		let events = events.clone();
 		async move {
@@ -559,7 +559,7 @@ async fn bare_disconnect_hook_stop_waits_for_every_other_hook() {
 	let release_caller = Arc::new(tokio::sync::Notify::new());
 	let hook_release_caller = release_caller.clone();
 	let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-	endpoint.on_session_disconnected(move |session| {
+	endpoint.on_disconnected(move |session| {
 		let handle_slot = hook_handle.clone();
 		let release_other = hook_release_other.clone();
 		let release_caller = hook_release_caller.clone();

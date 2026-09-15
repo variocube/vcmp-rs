@@ -49,14 +49,15 @@ rustls, pure-Rust crypto only for native builds — see [Cross-compilation](#cro
 The drivers only need `client`. The axum/hyper dependencies are optional: builds with only
 `client` or `server` retain the lightweight standalone transport.
 
-A message type is any `Serialize + Deserialize` whose `@type` is the serde tag:
+A message type is a plain serde struct plus its `@type`, declared once in `VcmpMessage::TYPE`.
+The library adds the `@type` member when sending and removes it before deserializing, so the
+struct never mentions it (and `#[serde(deny_unknown_fields)]` works):
 
 ```rust
 use serde::{Deserialize, Serialize};
 use vcmp::VcmpMessage;
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "device:DeviceAdded")]
 struct DeviceAdded { id: String, vendor: String }
 
 impl VcmpMessage for DeviceAdded {
@@ -64,29 +65,42 @@ impl VcmpMessage for DeviceAdded {
 }
 ```
 
+A handler is any `async fn(M, Session) -> Result<R, VcmpError>` — or a closure of that shape with
+the message type on its first parameter. `R: Serialize` becomes the `ACK` payload; `()` yields an
+`ACK` without payload; the error becomes the `NAK`. Foreign errors get a status and title through
+`ResultExt::or_problem`, or a plain `500` through `VcmpError::from_error`:
+
+```rust
+use vcmp::{ResultExt, Session, VcmpError};
+
+async fn open_lock(open: OpenLock, _session: Session) -> Result<(), VcmpError> {
+    hardware.open(&open.id).await.or_problem(503, "Lock unreachable")?;
+    Ok(())
+}
+```
+
 ### Client
 
 ```rust
 use std::time::Duration;
-use vcmp::{Backoff, VcmpClient, VcmpError};
+use vcmp::{Backoff, VcmpClient};
 
 let client = VcmpClient::builder("ws://localhost:2000/drivers/kerong")
     .header("Authorization", token)                                   // custom handshake headers
     .reconnect(Backoff::exponential(Duration::from_secs(1), Duration::from_secs(30)))
     .build();
 
-// handler: Fn(M, Session) -> Future<Output = Result<impl Serialize, impl Into<VcmpError>>>
-client.on::<OpenLock, _, _, _, _>(|open, _session| async move {
-    hardware.open(&open.id).await?;
-    Ok::<_, VcmpError>(())        // ACK without payload
-});
-client.on_open(|session| async move {
+client.on(open_lock);                                                 // the async fn above
+client.on(|restart: RestartDevice, _session| async move { Ok(()) }); // or inline
+client.on_connected(|session| async move {
     session.send(&DeviceAdded { id: "lock-1".into(), vendor: "Kerong".into() }).await.ok();
 });
+client.on_disconnected(|session| async move { tracing::info!(session = session.id(), "disconnected") });
 
 client.start();                                                       // connects and reconnects
 let result: serde_json::Value = client.send(&msg).await?;             // Result<Value, VcmpError>
 let typed: Ack = client.send_as::<_, Ack>(&msg).await?;               // deserialized result
+client.send_value(&serde_json::json!({"@type": "echo"})).await?;      // untyped: you supply @type
 tokio::time::timeout(Duration::from_secs(20), client.send(&msg)).await??;   // caller-side bound
 client.stop_and_wait().await;                                        // fails pending sends and bounds shutdown
 ```
@@ -95,17 +109,18 @@ client.stop_and_wait().await;                                        // fails pe
 
 ```rust
 use std::time::Duration;
-use vcmp::{VcmpServer, VcmpError};
+use vcmp::VcmpServer;
 
 let server = VcmpServer::builder().heartbeat_interval(Duration::from_secs(20)).build();
 let drivers = server.endpoint("/drivers/{driver}");                  // path params are readable
-drivers.on::<DeviceAdded, _, _, _, _>(|device, session| async move {
+drivers.on(|device: DeviceAdded, session| async move {
     let driver = session.connect_info().unwrap().param("driver").unwrap_or_default();
     tracing::info!(driver, id = device.id, "device added");
-    Ok::<_, VcmpError>(())
+    Ok(())
 });
-drivers.on_session_connected(|session| async move { /* … */ });
-drivers.on_session_disconnected(|session| async move { /* … */ });
+drivers.on_type("echo", |message: serde_json::Value, _session| async move { Ok(message) }); // untyped, @type kept
+drivers.on_connected(|session| async move { /* … */ });
+drivers.on_disconnected(|session| async move { /* … */ });
 
 let handle = server.bind("0.0.0.0:2000").await?;
 let results = drivers.broadcast(&msg).await;                          // per-session Ok/Err, never fails as a whole

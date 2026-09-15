@@ -5,8 +5,8 @@
 //!     .header("Authorization", token)
 //!     .reconnect(Backoff::exponential(Duration::from_secs(1), Duration::from_secs(30)))
 //!     .build();
-//! client.on::<Hello, _, _, _, _>(|msg, session| async move { Ok::<_, VcmpError>(()) });
-//! client.on_open(|session| async move { /* announce devices */ });
+//! client.on(|msg: Hello, _session: Session| async move { Ok(()) });
+//! client.on_connected(|session| async move { /* announce devices */ });
 //! client.start();
 //! let result = client.send(&Hello { from: "driver".into() }).await?;
 //! client.stop();
@@ -89,10 +89,9 @@ impl Default for Backoff {
 }
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-type OpenHook = Arc<dyn Fn(Session) -> BoxFuture + Send + Sync>;
+type SessionHook = Arc<dyn Fn(Session) -> BoxFuture + Send + Sync>;
 type HeaderFuture = Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, VcmpError>> + Send>>;
 type HeaderFactory = Arc<dyn Fn() -> HeaderFuture + Send + Sync>;
-type CloseHook = Arc<dyn Fn() -> BoxFuture + Send + Sync>;
 
 /// Configures a [`VcmpClient`].
 #[derive(Clone)]
@@ -180,8 +179,8 @@ impl ClientBuilder {
 			inner: Arc::new(ClientInner {
 				config: self,
 				handlers: Arc::new(HandlerMap::new()),
-				on_open: Mutex::new(None),
-				on_close: Mutex::new(None),
+				on_connected: Mutex::new(None),
+				on_disconnected: Mutex::new(None),
 				state: Mutex::new(ClientState::default()),
 				connected,
 			}),
@@ -207,7 +206,7 @@ struct ClientTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
 	No,
-	/// `stop()`: close the session, notify `on_close`.
+	/// `stop()`: close the session, notify `on_disconnected`.
 	Notify,
 	/// `start()` replacing a running client: close the old session silently.
 	Quiet,
@@ -216,8 +215,8 @@ enum Stop {
 struct ClientInner {
 	config: ClientBuilder,
 	handlers: Arc<HandlerMap>,
-	on_open: Mutex<Option<OpenHook>>,
-	on_close: Mutex<Option<CloseHook>>,
+	on_connected: Mutex<Option<SessionHook>>,
+	on_disconnected: Mutex<Option<SessionHook>>,
 	state: Mutex<ClientState>,
 	connected: watch::Sender<bool>,
 }
@@ -250,28 +249,26 @@ impl VcmpClient {
 	}
 
 	/// Registers the handler for messages of type `M`. See [`HandlerMap::on`].
-	pub fn on<M, F, Fut, R, E>(&self, handler: F) -> &Self
+	pub fn on<M, F, Fut, R>(&self, handler: F) -> &Self
 	where
 		M: VcmpMessage + Send + 'static,
 		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
-		Fut: Future<Output = Result<R, E>> + Send + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
 		R: Serialize,
-		E: Into<VcmpError>,
 	{
-		self.inner.handlers.on::<M, F, Fut, R, E>(handler);
+		self.inner.handlers.on(handler);
 		self
 	}
 
 	/// Registers the handler for messages with the given `@type`. See [`HandlerMap::on_type`].
-	pub fn on_type<M, F, Fut, R, E>(&self, type_: &str, handler: F) -> &Self
+	pub fn on_type<M, F, Fut, R>(&self, type_: &str, handler: F) -> &Self
 	where
 		M: DeserializeOwned + Send + 'static,
 		F: Fn(M, Session) -> Fut + Send + Sync + 'static,
-		Fut: Future<Output = Result<R, E>> + Send + 'static,
+		Fut: Future<Output = Result<R, VcmpError>> + Send + 'static,
 		R: Serialize,
-		E: Into<VcmpError>,
 	{
-		self.inner.handlers.on_type::<M, F, Fut, R, E>(type_, handler);
+		self.inner.handlers.on_type(type_, handler);
 		self
 	}
 
@@ -287,30 +284,32 @@ impl VcmpClient {
 	}
 
 	/// Sets the hook that runs each time a connection is established, with the new session.
-	pub fn on_open<F, Fut>(&self, hook: F) -> &Self
+	pub fn on_connected<F, Fut>(&self, hook: F) -> &Self
 	where
 		F: Fn(Session) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
 	{
-		*self.inner.on_open.lock().unwrap_or_else(|e| e.into_inner()) =
+		*self.inner.on_connected.lock().unwrap_or_else(|e| e.into_inner()) =
 			Some(Arc::new(move |session| Box::pin(hook(session))));
 		self
 	}
 
-	/// Sets the hook that runs each time the connection closes (also on [`VcmpClient::stop`]).
-	pub fn on_close<F, Fut>(&self, hook: F) -> &Self
+	/// Sets the hook that runs each time the connection closes (also on [`VcmpClient::stop`]),
+	/// with the session that closed.
+	pub fn on_disconnected<F, Fut>(&self, hook: F) -> &Self
 	where
-		F: Fn() -> Fut + Send + Sync + 'static,
+		F: Fn(Session) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ()> + Send + 'static,
 	{
-		*self.inner.on_close.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(move || Box::pin(hook())));
+		*self.inner.on_disconnected.lock().unwrap_or_else(|e| e.into_inner()) =
+			Some(Arc::new(move |session| Box::pin(hook(session))));
 		self
 	}
 
 	/// Connects and keeps the connection alive until [`VcmpClient::stop`].
 	///
 	/// Calling `start` on a running client replaces its connection: a pending reconnect is
-	/// cancelled and the current session is closed without notifying `on_close`. Must be called
+	/// cancelled and the current session is closed without notifying `on_disconnected`. Must be called
 	/// from within a tokio runtime.
 	pub fn start(&self) {
 		let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -407,17 +406,22 @@ impl VcmpClient {
 	/// Sends a message on the current session. See [`Session::send`].
 	///
 	/// Fails with `503 Not connected` when there is no session.
-	pub async fn send<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
+	pub async fn send<M: VcmpMessage>(&self, message: &M) -> Result<Value, VcmpError> {
 		self.current_session()?.send(message).await
 	}
 
 	/// Sends a message on the current session, deserializing the result. See [`Session::send_as`].
 	pub async fn send_as<M, R>(&self, message: &M) -> Result<R, VcmpError>
 	where
-		M: Serialize + ?Sized,
+		M: VcmpMessage,
 		R: DeserializeOwned,
 	{
 		self.current_session()?.send_as(message).await
+	}
+
+	/// Sends an untyped value on the current session. See [`Session::send_value`].
+	pub async fn send_value<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
+		self.current_session()?.send_value(message).await
 	}
 
 	fn current_session(&self) -> Result<Session, VcmpError> {
@@ -442,7 +446,7 @@ impl VcmpClient {
 					if !inner.config.initial_heartbeat_timeout.is_zero() {
 						session.expect_heartbeat(inner.config.initial_heartbeat_timeout);
 					}
-					if let Some(hook) = inner.open_hook() {
+					if let Some(hook) = inner.connected_hook() {
 						if let Ok(_permit) = inner.config.transport.budget.reserve(Resource::Handler, 0) {
 							tokio::select! {
 								_ = tokio::time::timeout(inner.config.transport.limits.handler_timeout, hook(session.clone())) => {},
@@ -464,10 +468,11 @@ impl VcmpClient {
 					let how = *stop.borrow();
 					if how != Stop::Quiet {
 						debug!("session closed");
-						if let Some(hook) = inner.close_hook() {
+						if let Some(hook) = inner.disconnected_hook() {
 							if let Ok(_permit) = inner.config.transport.budget.reserve(Resource::Handler, 0) {
 								let _ =
-									tokio::time::timeout(inner.config.transport.limits.handler_timeout, hook()).await;
+									tokio::time::timeout(inner.config.transport.limits.handler_timeout, hook(session))
+										.await;
 							}
 						}
 					}
@@ -523,12 +528,12 @@ impl VcmpClient {
 }
 
 impl ClientInner {
-	fn open_hook(&self) -> Option<OpenHook> {
-		self.on_open.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	fn connected_hook(&self) -> Option<SessionHook> {
+		self.on_connected.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
-	fn close_hook(&self) -> Option<CloseHook> {
-		self.on_close.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	fn disconnected_hook(&self) -> Option<SessionHook> {
+		self.on_disconnected.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
 	/// Sets the current session, unless a later `start()` has replaced this generation.

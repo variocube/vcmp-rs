@@ -20,10 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use tracing::{info, warn};
-use vcmp::{Backoff, VcmpClient, VcmpError, VcmpMessage};
+use vcmp::{Backoff, Session, VcmpClient, VcmpError, VcmpMessage};
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "device:DeviceAdded")]
 struct DeviceAdded {
 	id: String,
 	types: Vec<String>,
@@ -34,8 +33,11 @@ struct DeviceAdded {
 	info: Value,
 }
 
+impl VcmpMessage for DeviceAdded {
+	const TYPE: &'static str = "device:DeviceAdded";
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "device:Restart")]
 struct RestartDevice {
 	id: String,
 }
@@ -45,7 +47,6 @@ impl VcmpMessage for RestartDevice {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "@type", rename = "locking:OpenLock")]
 struct OpenLock {
 	id: String,
 	#[serde(rename = "unlockTime", default)]
@@ -54,6 +55,21 @@ struct OpenLock {
 
 impl VcmpMessage for OpenLock {
 	const TYPE: &'static str = "locking:OpenLock";
+}
+
+/// Acknowledges an `echo` message with the message itself.
+async fn echo(message: Value, _session: Session) -> Result<Value, VcmpError> {
+	Ok(message)
+}
+
+async fn restart_device(restart: RestartDevice, _session: Session) -> Result<(), VcmpError> {
+	info!(id = restart.id, "restart requested");
+	Ok(())
+}
+
+async fn open_lock(open: OpenLock, _session: Session) -> Result<(), VcmpError> {
+	info!(id = open.id, unlock_time = open.unlock_time, "open lock requested");
+	Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -69,16 +85,10 @@ async fn main() {
 	let client = VcmpClient::builder(&url)
 		.reconnect(Backoff::exponential(Duration::from_secs(1), Duration::from_secs(30)))
 		.build();
-	client.on_type::<Value, _, _, _, _>("echo", |message, _| async move { Ok::<_, VcmpError>(message) });
-	client.on::<RestartDevice, _, _, _, _>(|restart, _| async move {
-		info!(id = restart.id, "restart requested");
-		Ok::<(), VcmpError>(())
-	});
-	client.on::<OpenLock, _, _, _, _>(|open, _| async move {
-		info!(id = open.id, "open lock requested");
-		Ok::<(), VcmpError>(())
-	});
-	client.on_open(move |session| async move {
+	client.on_type("echo", echo);
+	client.on(restart_device);
+	client.on(open_lock);
+	client.on_connected(move |session| async move {
 		info!("connected");
 		if announce {
 			let device = DeviceAdded {
@@ -95,7 +105,7 @@ async fn main() {
 			}
 		}
 	});
-	client.on_close(|| async { info!("disconnected") });
+	client.on_disconnected(|session| async move { info!(session = session.id(), "disconnected") });
 	client.start();
 
 	if report {

@@ -13,19 +13,22 @@
 //! - [`axum`] (feature `axum`): VCMP endpoints alongside HTTP routes in an axum router.
 //!
 //! ```ignore
-//! use vcmp::{VcmpClient, VcmpMessage, Backoff};
+//! use vcmp::{Backoff, Session, VcmpClient, VcmpError, VcmpMessage};
 //!
 //! #[derive(serde::Serialize, serde::Deserialize)]
-//! #[serde(tag = "@type", rename = "hello")]
 //! struct Hello { from: String }
 //! impl VcmpMessage for Hello { const TYPE: &'static str = "hello"; }
+//!
+//! async fn hello(msg: Hello, _session: Session) -> Result<serde_json::Value, VcmpError> {
+//!     Ok(serde_json::json!({"ok": true, "from": msg.from}))
+//! }
 //!
 //! let client = VcmpClient::builder("ws://localhost:2000/drivers/kerong")
 //!     .header("Authorization", "Bearer …")
 //!     .reconnect(Backoff::exponential(Duration::from_secs(1), Duration::from_secs(30)))
 //!     .build();
-//! client.on::<Hello, _, _, _, _>(|msg, _session| async move { Ok::<_, VcmpError>(serde_json::json!({"ok": true})) });
-//! client.on_open(|_session| async move { tracing::info!("connected") });
+//! client.on(hello);
+//! client.on_connected(|_session| async move { tracing::info!("connected") });
 //! client.start();
 //! let result: serde_json::Value = client.send(&Hello { from: "driver".into() }).await?;
 //! ```
@@ -47,7 +50,7 @@ pub mod server;
 #[cfg(any(feature = "client", feature = "server"))]
 mod ws;
 
-pub use error::{ProblemDetail, VcmpError};
+pub use error::{ProblemDetail, ResultExt, VcmpError};
 pub use frame::Frame;
 pub use resources::{ResourceBudget, ResourceLimits, ResourceSnapshot};
 pub use session::{ConnectInfo, HandlerMap, Session, SessionLimits, SessionOptions, VcmpMessage};
