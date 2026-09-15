@@ -41,7 +41,7 @@ Add it as a git dependency (not published to crates.io):
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.3.1" }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.0" }
 ```
 
 Feature flags: `client` (default), `server`, `axum` (includes `server`), `tls` (`wss://` via
@@ -135,7 +135,7 @@ listener and HTTP shutdown:
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.3.1", default-features = false, features = ["axum"] }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.0", default-features = false, features = ["axum"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 ```
