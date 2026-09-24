@@ -9,8 +9,8 @@ use std::fmt;
 /// The problem detail carried by a `NAK` frame (RFC 7807 shape, as in `vcmp-js` and Spring's
 /// `ProblemDetail`).
 ///
-/// Status codes in use across the implementations: `400` invalid message, `500` handler failure,
-/// `503` local transport condition (session not open / closed, not connected).
+/// Status codes describe the failure, not its origin: a peer may return the same status as a
+/// local failure. Use [`VcmpError::is_transport`] to identify locally detected transport failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProblemDetail {
 	/// A short, human-readable summary of the problem type.
@@ -88,17 +88,29 @@ impl fmt::Display for ProblemDetail {
 
 /// The error type of every fallible VCMP operation.
 ///
-/// A `VcmpError` *is* a [`ProblemDetail`] (the one sent in / received from a `NAK`), plus an
-/// optional source error for local failures. It serializes exactly like the problem detail.
+/// Contains a [`ProblemDetail`] (the one sent in / received from a `NAK`), an optional source,
+/// and a private origin classification used by [`Self::is_transport`]. Only the problem detail
+/// is serialized. Cloning preserves the classification; converting to a problem detail or
+/// serializing and deserializing loses it. Neither peer fields nor status codes can establish
+/// local transport origin.
 #[derive(Debug)]
 pub struct VcmpError {
 	// Boxed to keep `Result<_, VcmpError>` small (the problem detail carries a map).
 	problem: Box<ProblemDetail>,
 	source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+	kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+	Other,
+	LocalTransport,
+	PeerNak,
 }
 
 impl VcmpError {
-	/// Creates an error with the given status and title.
+	/// Creates an application error with the given status and title. Even a `503` or `504`
+	/// created here is not a local transport failure.
 	pub fn new(status: u16, title: impl Into<String>) -> Self {
 		ProblemDetail::new(status, title).into()
 	}
@@ -164,7 +176,7 @@ impl VcmpError {
 		&self.problem
 	}
 
-	/// Consumes the error, returning its problem detail.
+	/// Consumes the error, returning its problem detail without its source or origin classification.
 	pub fn into_problem(self) -> ProblemDetail {
 		*self.problem
 	}
@@ -184,22 +196,48 @@ impl VcmpError {
 		self.problem.detail.as_deref()
 	}
 
-	/// Whether this is a local transport condition (`503`: session not open / closed, not
-	/// connected) rather than a peer-side rejection. These are the retryable errors.
+	/// Whether VCMP detected a local transport failure: no connection, a closed session,
+	/// acknowledgement timeout, or transport resource admission overload.
+	///
+	/// Peer NAKs and application-created errors return `false` regardless of status, title, or
+	/// extra properties. Serialization, message size, and ACK decoding errors also return `false`.
+	///
+	/// This is not a replay guarantee: after a timeout or disconnect the peer may already have
+	/// processed the message. The caller owns retry policy, including any retries of peer NAKs.
 	pub fn is_transport(&self) -> bool {
-		self.problem.status == 503
+		self.kind == ErrorKind::LocalTransport
+	}
+
+	fn transport(status: u16, title: &str) -> Self {
+		let mut error = Self::new(status, title);
+		error.kind = ErrorKind::LocalTransport;
+		error
+	}
+
+	pub(crate) fn into_peer_error(mut self) -> Self {
+		self.kind = ErrorKind::PeerNak;
+		self
 	}
 
 	pub(crate) fn session_not_open(detail: &str) -> Self {
-		VcmpError::new(503, "Session not open").with_detail(detail)
+		Self::transport(503, "Session not open").with_detail(detail)
 	}
 
 	pub(crate) fn session_closed(detail: &str) -> Self {
-		VcmpError::new(503, "Session closed").with_detail(detail)
+		Self::transport(503, "Session closed").with_detail(detail)
 	}
 
 	pub(crate) fn not_connected(detail: &str) -> Self {
-		VcmpError::new(503, "Not connected").with_detail(detail)
+		Self::transport(503, "Not connected").with_detail(detail)
+	}
+
+	pub(crate) fn transport_overloaded() -> Self {
+		Self::transport(503, "Transport overloaded")
+	}
+
+	pub(crate) fn acknowledgement_timeout() -> Self {
+		Self::transport(504, "Acknowledgement timed out")
+			.with_detail("Delivery or mutation outcome is unknown; do not automatically replay.")
 	}
 }
 
@@ -218,6 +256,7 @@ impl VcmpError {
 /// }
 /// ```
 ///
+/// The resulting error is an application error, regardless of the chosen status or source.
 /// For a plain `500` with the error's type name as title, use `.map_err(VcmpError::from_error)?`.
 pub trait ResultExt<T> {
 	/// Maps the error to a problem detail with the given status and title.
@@ -250,14 +289,14 @@ impl StdError for VcmpError {
 }
 
 impl Clone for VcmpError {
-	/// Clones the problem detail; the (non-clonable) source is dropped.
+	/// Clones the problem detail and origin classification; the (non-clonable) source is dropped.
 	fn clone(&self) -> Self {
-		VcmpError { problem: self.problem.clone(), source: None }
+		VcmpError { problem: self.problem.clone(), source: None, kind: self.kind }
 	}
 }
 
 impl PartialEq for VcmpError {
-	/// Compares the problem details only.
+	/// Compares the problem details only, ignoring source and origin classification.
 	fn eq(&self, other: &Self) -> bool {
 		self.problem == other.problem
 	}
@@ -276,12 +315,14 @@ impl<'de> Deserialize<'de> for VcmpError {
 }
 
 impl From<ProblemDetail> for VcmpError {
+	/// Wraps a problem detail without inferring local transport origin from its contents.
 	fn from(problem: ProblemDetail) -> Self {
-		VcmpError { problem: Box::new(problem), source: None }
+		VcmpError { problem: Box::new(problem), source: None, kind: ErrorKind::Other }
 	}
 }
 
 impl From<VcmpError> for ProblemDetail {
+	/// Extracts the problem detail, discarding the source and origin classification.
 	fn from(error: VcmpError) -> Self {
 		*error.problem
 	}
@@ -311,6 +352,7 @@ impl From<Box<dyn StdError + Send + Sync + 'static>> for VcmpError {
 				VcmpError {
 					problem: Box::new(ProblemDetail::new(500, "Error").with_detail(detail)),
 					source: Some(other),
+					kind: ErrorKind::Other,
 				}
 			}
 		}
@@ -338,6 +380,80 @@ impl From<std::convert::Infallible> for VcmpError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn local_transport_classification_does_not_depend_on_status() {
+		let errors = [
+			VcmpError::session_not_open("closed before sending"),
+			VcmpError::session_closed("closed before acknowledgement"),
+			VcmpError::not_connected("no session"),
+			VcmpError::transport_overloaded(),
+			VcmpError::acknowledgement_timeout(),
+		];
+		for error in errors {
+			assert!(error.is_transport(), "{error}");
+			assert!(!VcmpError::new(error.status(), error.title()).is_transport());
+			assert!(!error.into_peer_error().is_transport());
+		}
+	}
+
+	#[test]
+	fn cloning_and_preserving_conversions_keep_local_origin() {
+		let error = VcmpError::session_closed("closed")
+			.with_type("about:blank")
+			.with_instance("/request/1")
+			.with_extra("request", "1")
+			.with_source(std::io::Error::other("connection lost"));
+		let cloned = error.clone();
+		assert!(cloned.is_transport());
+		assert!(cloned.source().is_none());
+		assert_eq!(cloned.problem(), error.problem());
+		let preserved = VcmpError::from_error(error);
+		assert!(preserved.is_transport());
+		assert!(preserved.source().is_some());
+		let boxed: Box<dyn StdError + Send + Sync> = Box::new(preserved);
+		let unboxed = VcmpError::from(boxed);
+		assert!(unboxed.is_transport());
+		assert!(unboxed.source().is_some());
+	}
+
+	#[test]
+	fn problem_detail_and_serialization_round_trips_discard_origin() {
+		let error = VcmpError::acknowledgement_timeout().with_extra("request", "1");
+		let wire = serde_json::to_value(&error).unwrap();
+		assert_eq!(wire, serde_json::to_value(error.problem()).unwrap());
+		let decoded: VcmpError = serde_json::from_value(wire).unwrap();
+		assert!(!decoded.is_transport());
+		assert_eq!(decoded, error); // Equality continues to compare only the problem detail.
+		assert!(!VcmpError::from(error.clone().into_problem()).is_transport());
+		let problem: ProblemDetail = error.into();
+		assert!(!VcmpError::from(problem).is_transport());
+	}
+
+	#[test]
+	fn forged_properties_cannot_establish_local_origin() {
+		for status in [408, 503, 504] {
+			let problem = ProblemDetail::new(status, "Session closed")
+				.with_extra("vcmp-local-connection", true)
+				.with_extra("kind", "LocalTransport");
+			let error = VcmpError::from(problem.clone());
+			assert!(!error.is_transport());
+			let decoded: VcmpError = serde_json::from_value(serde_json::to_value(&problem).unwrap()).unwrap();
+			assert!(!decoded.is_transport());
+			assert_eq!(decoded.problem(), &problem);
+		}
+	}
+
+	#[test]
+	fn application_errors_do_not_inherit_transport_origin_from_their_source() {
+		let error = VcmpError::new(503, "Application failed").with_source(VcmpError::session_closed("closed"));
+		assert!(!error.is_transport());
+		let remapped = Err::<(), _>(VcmpError::session_closed("closed")).or_problem(503, "Application failed");
+		assert!(!remapped.unwrap_err().is_transport());
+		assert!(!VcmpError::from(std::io::Error::other("disk failed")).is_transport());
+		let boxed: Box<dyn StdError + Send + Sync> = Box::new(std::io::Error::other("disk failed"));
+		assert!(!VcmpError::from(boxed).is_transport());
+	}
 
 	#[test]
 	fn or_problem_maps_foreign_errors() {
