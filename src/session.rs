@@ -445,7 +445,10 @@ impl Session {
 	/// detail, `503 Session not open` when the session is not open, or `503 Session closed` when
 	/// the session closes while the send is outstanding.
 	///
-	/// The configured request deadline applies. Dropping this future removes retained correlation state.
+	/// The configured request deadline applies. A local acknowledgement timeout returns `504`
+	/// with [`VcmpError::is_transport`] set to `true`; a peer NAK returns `false` for any status.
+	/// Timeout or disconnect leaves delivery and mutation outcome unknown; retries are caller policy.
+	/// Dropping this future removes retained correlation state.
 	pub async fn send<M: VcmpMessage>(&self, message: &M) -> Result<Value, VcmpError> {
 		self.send_value(&Tagged { type_: M::TYPE, message }).await
 	}
@@ -507,8 +510,7 @@ impl Session {
 		match tokio::time::timeout(self.inner.limits.request_timeout, rx).await {
 			Ok(Ok(result)) => result,
 			Ok(Err(_)) => Err(VcmpError::session_closed("The session closed before acknowledgement.")),
-			Err(_) => Err(VcmpError::new(504, "Acknowledgement timed out")
-				.with_detail("Delivery or mutation outcome is unknown; do not automatically replay.")),
+			Err(_) => Err(VcmpError::acknowledgement_timeout()),
 		}
 	}
 
@@ -569,7 +571,7 @@ impl Session {
 		let resource = if control { Resource::Control } else { Resource::Data };
 		let permits = self.reserve(resource, text.len())?;
 		let tx = if control { &self.inner.control_tx } else { &self.inner.out_tx };
-		tx.try_send(Outgoing { text, _permits: permits }).map_err(|_| VcmpError::new(503, "Transport overloaded"))
+		tx.try_send(Outgoing { text, _permits: permits }).map_err(|_| VcmpError::transport_overloaded())
 	}
 
 	fn write(&self, frame: Frame) -> bool {
@@ -660,7 +662,7 @@ impl Session {
 						.with_source(error)
 				}),
 			};
-			let _ = tx.send(Err(error));
+			let _ = tx.send(Err(error.into_peer_error()));
 		} else {
 			self.diagnose("late or unknown NAK");
 		}

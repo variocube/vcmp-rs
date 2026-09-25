@@ -173,11 +173,14 @@ pub async fn we_send(session: &Session) {
 	assert_eq!(session.send(&Echo { payload: "hello".into() }).await.unwrap(), "hello");
 	assert_eq!(session.send(&Void {}).await.unwrap(), Value::Null);
 
-	let error =
-		session.send(&Fail { status: 422, title: "Unprocessable".into(), detail: "nope".into() }).await.unwrap_err();
-	assert_eq!(error.status(), 422);
-	assert_eq!(error.title(), "Unprocessable");
-	assert_eq!(error.detail(), Some("nope"));
+	for status in [422, 408, 503, 504] {
+		let error =
+			session.send(&Fail { status, title: "Peer failure".into(), detail: "nope".into() }).await.unwrap_err();
+		assert_eq!(error.status(), status);
+		assert_eq!(error.title(), "Peer failure");
+		assert_eq!(error.detail(), Some("nope"));
+		assert!(!error.is_transport());
+	}
 
 	let error = session.send(&Unknown {}).await.unwrap_err();
 	assert_eq!(error.status(), 500, "{error}");

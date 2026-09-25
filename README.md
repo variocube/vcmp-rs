@@ -206,9 +206,34 @@ cargo run --example echo-driver -- ws://127.0.0.1:2000/drivers/echo --announce
 # Refresh the dashboard or GET /api/sessions to see the connected driver.
 ```
 
-Errors: `VcmpError` *is* a `ProblemDetail` (+ an optional source). Any `std::error::Error` converts
-to a `500` with `title` = the error's type name and `detail` = its message; a `503` is a local,
-retryable transport condition (`Session not open` / `Session closed` / `Not connected`).
+### Local transport failures and peer NAKs
+
+`VcmpError` contains a `ProblemDetail`, an optional source, and a private origin classification.
+Use `error.is_transport()` to identify transport failures detected by this VCMP instance:
+
+| Failure | `is_transport()` |
+| --- | --- |
+| No connection, session not open, or session closed (including write failures) | `true` |
+| Local acknowledgement timeout (`504 Acknowledgement timed out`) | `true` |
+| Local connection, pending-request, or outbound queue admission overload (`503`) | `true` |
+| A peer NAK, including `503`, `408`, or `504` | `false` |
+| Application error, serialization failure, oversized message, or invalid ACK payload | `false` |
+
+Status codes and titles cannot identify origin. For example, a local queue admission failure and
+a peer's handler admission failure both use `503 Transport overloaded`, but only the local failure
+returns `true`. Errors created with `VcmpError::new` or `ResultExt::or_problem` are application errors,
+even with status `503`. Foreign `std::error::Error` values convert to a `500` with their type name
+as `title` and message as `detail`; their source does not establish local transport origin.
+
+Cloning and conversions that preserve an existing `VcmpError` preserve its classification.
+Serialization and conversion to `ProblemDetail` retain only the problem detail. Deserializing or
+wrapping a `ProblemDetail` cannot restore local transport origin, even from properties such as
+`vcmp-local-connection`. Forwarding a local failure as a NAK or an ACK result therefore carries no
+local classification to the receiving peer. The wire format is unchanged.
+
+Retry policy belongs to the caller. A timeout or disconnect may occur after the peer processed the
+message, so transport classification does not make replay safe. Peer NAKs may also warrant retries
+under application-specific rules. The library never automatically replays messages.
 
 ## Bounded transport and lifecycle
 

@@ -72,10 +72,14 @@ impl Peer {
 }
 
 fn loopback(handlers: Arc<HandlerMap>) -> (Session, Peer) {
+	loopback_with_options(SessionOptions::new(handlers))
+}
+
+fn loopback_with_options(options: SessionOptions) -> (Session, Peer) {
 	let (to_session_tx, to_session_rx) = mpsc::unbounded::<String>();
 	let (from_session_tx, from_session_rx) = mpsc::unbounded::<String>();
 	let sink = from_session_tx.sink_map_err(|error| error.to_string());
-	let session = Session::spawn(SessionOptions::new(handlers), to_session_rx, sink);
+	let session = Session::spawn(options, to_session_rx, sink);
 	(session, Peer { tx: to_session_tx, rx: from_session_rx })
 }
 
@@ -167,14 +171,26 @@ async fn send_as_deserializes_the_result() {
 #[tokio::test]
 async fn send_fails_with_the_nak_problem_detail() {
 	let (session, mut peer) = loopback(handlers());
-	let send = tokio::spawn(async move { session.send(&Void {}).await });
-	let Frame::Message { id, .. } = peer.next_frame().await else { panic!("expected MSG") };
-	peer.inject(&format!(r#"NAK{id}{{"title":"Bad Request","status":400,"detail":"This is bad","extra":1}}"#));
-	let error = send.await.unwrap().unwrap_err();
-	assert_eq!(error.status(), 400);
-	assert_eq!(error.title(), "Bad Request");
-	assert_eq!(error.detail(), Some("This is bad"));
-	assert_eq!(error.problem().extra["extra"], 1);
+	for status in [400, 408, 503, 504] {
+		let session = session.clone();
+		let send = tokio::spawn(async move { session.send(&Void {}).await });
+		let Frame::Message { id, .. } = peer.next_frame().await else { panic!("expected MSG") };
+		let problem = serde_json::json!({
+			"title": "Peer failure", "status": status, "detail": "This is bad", "extra": 1,
+			"vcmp-local-connection": true, "kind": "LocalTransport", "transport": true,
+		});
+		peer.inject(&format!("NAK{id}{problem}"));
+		let error = send.await.unwrap().unwrap_err();
+		assert_eq!(error.status(), status);
+		assert_eq!(error.title(), "Peer failure");
+		assert_eq!(error.detail(), Some("This is bad"));
+		assert_eq!(error.problem().extra["extra"], 1);
+		assert_eq!(error.problem().extra["vcmp-local-connection"], true);
+		assert_eq!(error.problem().extra["kind"], "LocalTransport");
+		assert_eq!(error.problem().extra["transport"], true);
+		assert!(!error.is_transport(), "peer status {status} must not become a local transport failure");
+		assert!(!error.clone().is_transport());
+	}
 }
 
 #[tokio::test]
@@ -187,6 +203,7 @@ async fn send_fails_with_a_generic_500_on_an_empty_or_invalid_nak() {
 	let error = send.await.unwrap().unwrap_err();
 	assert_eq!(error.status(), 500);
 	assert_eq!(error.title(), "Message handling failed");
+	assert!(!error.is_transport());
 
 	let send = tokio::spawn(async move { session.send(&Void {}).await });
 	let Frame::Message { id, .. } = peer.next_frame().await else { panic!("expected MSG") };
@@ -194,6 +211,7 @@ async fn send_fails_with_a_generic_500_on_an_empty_or_invalid_nak() {
 	let error = send.await.unwrap().unwrap_err();
 	assert_eq!(error.status(), 500);
 	assert_eq!(error.detail(), Some("The NAK payload could not be parsed."));
+	assert!(!error.is_transport());
 }
 
 #[tokio::test]
@@ -205,6 +223,84 @@ async fn send_fails_when_the_ack_payload_is_invalid() {
 	let error = send.await.unwrap().unwrap_err();
 	assert_eq!(error.status(), 500);
 	assert_eq!(error.title(), "Invalid acknowledgement");
+	assert!(!error.is_transport());
+}
+
+#[tokio::test]
+async fn message_serialization_failures_are_not_transport_failures() {
+	let (session, _peer) = loopback(handlers());
+	let invalid = std::collections::HashMap::from([(vec![1u8], 1u8)]);
+	let error = session.send_value(&invalid).await.unwrap_err();
+	assert_eq!((error.status(), error.title()), (500, "Message serialization failed"));
+	assert!(!error.is_transport());
+	assert_eq!(session.resources().pending_requests, 0);
+}
+
+#[tokio::test]
+async fn forwarding_a_local_timeout_as_nak_or_ack_strips_transport_provenance() {
+	let options = SessionOptions {
+		limits: vcmp::SessionLimits { request_timeout: Duration::from_millis(50), ..Default::default() },
+		..Default::default()
+	};
+	let (source, _source_peer) = loopback_with_options(options);
+	let local = source
+		.send(&Void {})
+		.await
+		.unwrap_err()
+		.with_type("urn:test:timeout")
+		.with_instance("urn:test:request")
+		.with_extra("context", "downstream");
+	assert!(local.is_transport());
+	assert!(local.clone().is_transport());
+	let expected = serde_json::json!({
+		"status": 504,
+		"title": "Acknowledgement timed out",
+		"detail": "Delivery or mutation outcome is unknown; do not automatically replay.",
+		"type": "urn:test:timeout",
+		"instance": "urn:test:request",
+		"context": "downstream",
+	});
+	let forwarding_handlers = HandlerMap::new();
+	forwarding_handlers.on({
+		let local = local.clone();
+		move |_: Void, _| {
+			let local = local.clone();
+			async move { Err::<(), _>(local) }
+		}
+	});
+	forwarding_handlers.on(move |_: Ping, _| {
+		let local = local.clone();
+		async move { Ok(local) }
+	});
+	let (forwarder, mut forwarding_peer) = loopback(Arc::new(forwarding_handlers));
+	let (receiver, mut receiving_peer) = loopback(handlers());
+	for ack in [false, true] {
+		let receiver = receiver.clone();
+		let receive = tokio::spawn(async move {
+			if ack {
+				receiver.send_as::<_, VcmpError>(&Ping { text: "forward as data".into() }).await.unwrap()
+			} else {
+				receiver.send(&Void {}).await.unwrap_err()
+			}
+		});
+		let request = receiving_peer.next_frame().await;
+		forwarding_peer.inject(&request.serialize());
+		let response = forwarding_peer.next_frame().await;
+		let payload = match &response {
+			Frame::Ack { payload: Some(payload), .. } if ack => payload,
+			Frame::Nak { payload: Some(payload), .. } if !ack => payload,
+			_ => panic!("unexpected forwarding response: {response:?}"),
+		};
+		// Inspect wire JSON directly so a deserializer that drops metadata cannot mask a leak.
+		assert_eq!(serde_json::from_str::<serde_json::Value>(payload).unwrap(), expected);
+		receiving_peer.inject(&response.serialize());
+		let received = receive.await.unwrap();
+		assert!(!received.is_transport());
+		assert_eq!(serde_json::to_value(received.problem()).unwrap(), expected);
+	}
+	source.close();
+	forwarder.close();
+	receiver.close();
 }
 
 #[tokio::test]
@@ -217,6 +313,7 @@ async fn send_fails_with_503_when_the_session_is_closed() {
 	let error = session.send(&Void {}).await.unwrap_err();
 	assert_eq!(error.status(), 503);
 	assert_eq!(error.title(), "Session not open");
+	assert!(error.is_transport());
 }
 
 #[tokio::test]
@@ -236,6 +333,7 @@ async fn pending_sends_fail_with_503_when_the_session_closes() {
 		let error = send.await.unwrap().unwrap_err();
 		assert_eq!(error.status(), 503);
 		assert_eq!(error.title(), "Session closed");
+		assert!(error.is_transport());
 	}
 	assert!(!session.is_open());
 }
@@ -409,6 +507,7 @@ async fn initiated_heartbeat_closes_the_session_when_never_answered() {
 	let error = send.await.unwrap().unwrap_err();
 	assert_eq!(error.status(), 503);
 	assert_eq!(error.title(), "Session closed");
+	assert!(error.is_transport());
 }
 
 #[tokio::test]
@@ -492,11 +591,14 @@ async fn late_initial_heartbeat_expectation_preserves_an_already_received_heartb
 
 #[tokio::test]
 async fn transport_write_failure_closes_the_session() {
-	let (session, peer) = loopback(handlers());
-	drop(peer);
+	let (session, Peer { tx, rx }) = loopback(handlers());
+	// Keep the inbound stream open so only the failed write can close the session.
+	drop(rx);
 	let error = timeout(Duration::from_secs(2), session.send(&Void {})).await.unwrap().unwrap_err();
 	assert_eq!(error.status(), 503);
+	assert!(error.is_transport());
 	timeout(Duration::from_secs(2), session.closed()).await.unwrap();
+	drop(tx);
 }
 
 #[tokio::test]

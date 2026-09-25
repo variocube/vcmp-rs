@@ -111,7 +111,7 @@ impl ResourceBudget {
 		};
 		if !admitted {
 			usage.overloads = usage.overloads.saturating_add(1);
-			return Err(VcmpError::new(503, "Transport overloaded"));
+			return Err(VcmpError::transport_overloaded());
 		}
 		match resource {
 			Resource::Connection => usage.connections += 1,

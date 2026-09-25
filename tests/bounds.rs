@@ -61,6 +61,7 @@ async fn dropped_and_timed_out_waiters_release_correlation_without_replay() {
 	peer.unbounded_send(Frame::ack(id, None).serialize()).unwrap();
 	let error = session.send_value(&json!({"@type": "mutate"})).await.unwrap_err();
 	assert_eq!(error.status(), 504);
+	assert!(error.is_transport());
 	assert_eq!(session.resources().pending_requests, 0);
 	assert!(matches!(frame(&mut outgoing).await, Frame::Message { .. }));
 	assert!(timeout(Duration::from_millis(20), outgoing.next()).await.is_err());
@@ -78,7 +79,9 @@ async fn shared_pending_request_limit_is_enforced_across_sessions() {
 		async move { first.send_value(&json!({})).await }
 	});
 	frame(&mut outgoing).await;
-	assert_eq!(second.send_value(&json!({})).await.unwrap_err().status(), 503);
+	let error = second.send_value(&json!({})).await.unwrap_err();
+	assert_eq!(error.status(), 503);
+	assert!(error.is_transport());
 	assert_eq!(budget.snapshot().pending_requests, 1);
 	assert_eq!(budget.snapshot().overloads, 1);
 	task.abort();
@@ -99,7 +102,9 @@ async fn connection_admission_does_not_spawn_rejected_sessions() {
 		futures_util::stream::pending::<String>(),
 		futures_util::sink::drain::<String>(),
 	);
-	assert_eq!(result.unwrap_err().status(), 503);
+	let error = result.unwrap_err();
+	assert_eq!(error.status(), 503);
+	assert!(error.is_transport());
 	assert_eq!(budget.snapshot().connections, 1);
 	session.close();
 	session.closed().await;
@@ -135,7 +140,9 @@ async fn overloaded_handlers_nak_while_heartbeats_progress_and_close_aborts_old_
 	until(|| session.resources().handler_tasks == 1).await;
 	peer.unbounded_send(Frame::message(r#"{"@type":"wait"}"#).serialize()).unwrap();
 	let Frame::Nak { payload: Some(payload), .. } = frame(&mut outgoing).await else { panic!("NAK expected") };
-	assert_eq!(serde_json::from_str::<VcmpError>(&payload).unwrap().status(), 503);
+	let error = serde_json::from_str::<VcmpError>(&payload).unwrap();
+	assert_eq!(error.status(), 503);
+	assert!(!error.is_transport());
 	peer.unbounded_send(Frame::heartbeat(10).serialize()).unwrap();
 	assert!(matches!(frame(&mut outgoing).await, Frame::Heartbeat { interval: 10 }));
 	assert_eq!(session.heartbeats_received(), 1);
@@ -153,7 +160,9 @@ async fn handler_deadline_releases_task_and_returns_504() {
 	let (session, peer, mut outgoing) = pair(SessionOptions { handlers, limits: limits(), ..Default::default() });
 	peer.unbounded_send(Frame::message(r#"{"@type":"wait"}"#).serialize()).unwrap();
 	let Frame::Nak { payload: Some(payload), .. } = frame(&mut outgoing).await else { panic!("NAK expected") };
-	assert_eq!(serde_json::from_str::<VcmpError>(&payload).unwrap().status(), 504);
+	let error = serde_json::from_str::<VcmpError>(&payload).unwrap();
+	assert_eq!(error.status(), 504);
+	assert!(!error.is_transport());
 	assert_eq!(session.resources().handler_tasks, 0);
 	session.close();
 	session.closed().await;
@@ -163,7 +172,12 @@ async fn handler_deadline_releases_task_and_returns_504() {
 async fn message_limit_rejects_serialization_and_disconnects_oversized_peer() {
 	let limits = SessionLimits { max_message_bytes: 64, ..limits() };
 	let (session, peer, _) = pair(SessionOptions { limits, ..Default::default() });
-	assert_eq!(session.send_value(&"x".repeat(100_000)).await.unwrap_err().status(), 413);
+	let error = session.send_value(&"x".repeat(100_000)).await.unwrap_err();
+	assert_eq!(error.status(), 413);
+	assert!(!error.is_transport());
+	let error = session.send_payload("x".repeat(100_000)).await.unwrap_err();
+	assert_eq!(error.status(), 413);
+	assert!(!error.is_transport());
 	assert_eq!(session.resources().pending_requests, 0);
 	peer.unbounded_send("x".repeat(65)).unwrap();
 	timeout(Duration::from_secs(1), session.closed()).await.unwrap();
@@ -182,6 +196,9 @@ async fn slow_writer_retains_bounded_bytes_and_reserves_control_progress() {
 	assert!(session.send_raw("MSG123456789012{}".into()));
 	assert!(session.send_raw("MSGabcdefghijkl{}".into()));
 	assert!(!session.send_raw("MSG000000000000{}".into()));
+	let error = session.send_value(&json!({})).await.unwrap_err();
+	assert_eq!(error.status(), 503);
+	assert!(error.is_transport());
 	assert_eq!(session.resources().queued_messages, 2);
 	assert_eq!(session.resources().queued_bytes, 34);
 	peer.unbounded_send(Frame::heartbeat(10).serialize()).unwrap();
@@ -198,16 +215,30 @@ async fn slow_writer_retains_bounded_bytes_and_reserves_control_progress() {
 
 #[tokio::test]
 async fn permanently_stalled_writer_is_cancelled_with_all_resources_released() {
-	let (peer, stream) = mpsc::unbounded();
+	let (_peer, stream) = mpsc::unbounded();
 	let (sink, _outgoing) = mpsc::channel::<String>(0);
 	let session = Session::spawn(
-		SessionOptions { limits: limits(), ..Default::default() },
+		SessionOptions {
+			limits: SessionLimits { request_timeout: Duration::from_secs(10), ..limits() },
+			..Default::default()
+		},
 		stream,
 		sink.sink_map_err(|e| e.to_string()),
 	);
-	assert!(session.send_raw("MSG123456789012{}".into()));
-	peer.unbounded_send(Frame::heartbeat(10).serialize()).unwrap();
+	let pending = tokio::spawn({
+		let session = session.clone();
+		async move { session.send_value(&json!({})).await }
+	});
+	until(|| session.resources().queued_messages == 1).await;
+	// Keep both transport halves open and avoid a heartbeat watchdog: only the write deadline
+	// can close this session before the longer request deadline. Queue control traffic for cleanup.
+	assert!(session.send_raw(Frame::ack("123456789012", None).serialize()));
+	assert_eq!(session.resources().control_messages, 1);
 	timeout(Duration::from_secs(1), session.closed()).await.unwrap();
+	let error = pending.await.unwrap().unwrap_err();
+	assert_eq!((error.status(), error.title()), (503, "Session closed"));
+	assert!(error.is_transport());
+	assert_eq!(session.resources().pending_requests, 0);
 	assert_eq!(session.resources().queued_bytes, 0);
 	assert_eq!(session.resources().control_bytes, 0);
 }

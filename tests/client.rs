@@ -35,15 +35,20 @@ async fn sends_and_receives_acknowledgements(host: ServerHost) {
 	assert_eq!(client.send_as::<_, String>(&Echo { payload: "typed".into() }).await.unwrap(), "typed");
 	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
 
-	let error =
-		client.send(&Fail { status: 422, title: "Unprocessable".into(), detail: "nope".into() }).await.unwrap_err();
-	assert_eq!((error.status(), error.title(), error.detail()), (422, "Unprocessable", Some("nope")));
+	for status in [422, 408, 503, 504] {
+		let error =
+			client.send(&Fail { status, title: "Peer failure".into(), detail: "nope".into() }).await.unwrap_err();
+		assert_eq!((error.status(), error.title(), error.detail()), (status, "Peer failure", Some("nope")));
+		assert!(!error.is_transport());
+	}
 
 	let error = client.send(&Unknown {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (500, "Message handling failed"));
+	assert!(!error.is_transport());
 
 	let error = client.session().unwrap().send_payload("{oops".into()).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (400, "Invalid message"));
+	assert!(!error.is_transport());
 
 	client.stop();
 	server.stop().await;
@@ -164,6 +169,7 @@ async fn closes_when_the_peer_stops_answering_heartbeats() {
 	assert!(elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2), "{elapsed:?}");
 	let error = pending.await.unwrap().unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Session closed"));
+	assert!(error.is_transport());
 	client.stop();
 }
 
@@ -232,6 +238,7 @@ async fn reconnects_after_a_server_restart(host: ServerHost) {
 	assert_eq!(closed_sessions.lock().unwrap().as_slice(), &[first_session]);
 	let error = client.send(&Void {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
+	assert!(error.is_transport());
 
 	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	connected(&client).await;
@@ -258,12 +265,14 @@ async fn stop_fails_pending_sends_and_does_not_reconnect(host: ServerHost) {
 	client.stop();
 	let error = pending.await.unwrap().unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Session closed"));
+	assert!(error.is_transport());
 	wait_until(|| endpoint.session_count() == 0).await;
 	tokio::time::sleep(Duration::from_millis(400)).await;
 	assert!(!client.is_connected());
 	assert_eq!(endpoint.session_count(), 0);
 	let error = client.send(&Void {}).await.unwrap_err();
 	assert_eq!(error.status(), 503);
+	assert!(error.is_transport());
 	server.stop().await;
 }
 
@@ -315,6 +324,7 @@ async fn send_without_session_fails_with_not_connected() {
 	let client = VcmpClient::builder("ws://127.0.0.1:1/").build();
 	let error = client.send(&Void {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
+	assert!(error.is_transport());
 }
 
 #[tokio::test]
