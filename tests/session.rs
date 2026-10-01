@@ -464,6 +464,53 @@ async fn handlers_run_off_the_read_loop() {
 }
 
 #[tokio::test]
+async fn arrivals_order_a_late_handler_before_a_later_ack() {
+	let gate = Arc::new(tokio::sync::Notify::new());
+	let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+	let arrival_tx = Arc::new(std::sync::Mutex::new(Some(arrival_tx)));
+	let handlers = HandlerMap::new();
+	let handler_gate = gate.clone();
+	handlers.on(move |_: Void, session: Session| {
+		let (gate, arrival_tx) = (handler_gate.clone(), arrival_tx.clone());
+		async move {
+			// The handler reads its arrival only after the ACK below has already settled.
+			gate.notified().await;
+			let _ = arrival_tx.lock().unwrap().take().unwrap().send(session.arrival());
+			Ok(())
+		}
+	});
+	let (session, mut peer) = loopback(Arc::new(handlers));
+	assert_eq!(session.arrival(), None);
+	let sender = session.clone();
+	let send = tokio::spawn(async move { sender.send_with_arrival(&Ping { text: "x".into() }).await });
+	let Frame::Message { id, .. } = peer.next_frame().await else { panic!("expected MSG") };
+	peer.inject(r#"MSGabcdefghijkl{"@type":"test:Void"}"#);
+	peer.inject(&format!("ACK{id}{{\"ok\":true}}"));
+	let (value, acked) = send.await.unwrap().unwrap();
+	assert_eq!(value, serde_json::json!({"ok": true}));
+	gate.notify_one();
+	let message = arrival_rx.await.unwrap().expect("a handler's session carries its message's arrival");
+	assert!(message < acked);
+	assert_eq!((message.session(), message.frame()), (session.id(), 1));
+	assert_eq!((acked.session(), acked.frame()), (session.id(), 2));
+	assert_eq!(peer.next_frame().await, Frame::ack("abcdefghijkl", None));
+}
+
+#[tokio::test]
+async fn arrivals_of_a_later_session_follow_those_of_an_earlier_one() {
+	let mut arrivals = vec![];
+	for _ in 0..2 {
+		let (session, mut peer) = loopback(handlers());
+		let send = tokio::spawn(async move { session.send_with_arrival(&Void {}).await });
+		let Frame::Message { id, .. } = peer.next_frame().await else { panic!("expected MSG") };
+		peer.inject(&format!("ACK{id}"));
+		arrivals.push(send.await.unwrap().unwrap().1);
+		peer.disconnect();
+	}
+	assert!(arrivals[0] < arrivals[1]);
+}
+
+#[tokio::test]
 async fn handlers_can_send_on_the_session() {
 	let handlers = HandlerMap::new();
 	handlers.on(|ping: Ping, session| async move {

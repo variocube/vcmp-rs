@@ -53,7 +53,7 @@ mod ws;
 pub use error::{ProblemDetail, ResultExt, VcmpError};
 pub use frame::Frame;
 pub use resources::{ResourceBudget, ResourceLimits, ResourceSnapshot};
-pub use session::{ConnectInfo, HandlerMap, Session, SessionLimits, SessionOptions, VcmpMessage};
+pub use session::{Arrival, ConnectInfo, HandlerMap, Session, SessionLimits, SessionOptions, VcmpMessage};
 
 #[cfg(feature = "client")]
 pub use client::{Backoff, ClientBuilder, VcmpClient};
