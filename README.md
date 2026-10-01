@@ -235,6 +235,22 @@ Retry policy belongs to the caller. A timeout or disconnect may occur after the 
 message, so transport classification does not make replay safe. Peer NAKs may also warrant retries
 under application-specific rules. The library never automatically replays messages.
 
+### Ordering messages against acknowledgements
+
+Handlers run concurrently, off the read loop, so a handler for a message the peer sent before an
+`ACK` can still be running after that `ACK` has settled the matching send. When the order matters,
+compare arrivals. Every received frame gets an `Arrival` in receive order: a handler reads its
+message's arrival from `session.arrival()`, and `session.send_with_arrival(&message)` returns the
+`ACK` payload together with the `ACK`'s arrival. Within a session, arrivals follow the order the
+peer sent the frames in. Across sessions they follow session creation, which matches receive order
+for sessions that do not overlap, such as the successive connections of one client.
+
+```rust
+let (_, acked) = session.send_with_arrival(&event).await?;
+// later, in a handler: the peer sent this message after acknowledging `event`
+let after = session.arrival().is_some_and(|arrival| arrival > acked);
+```
+
 ## Bounded transport and lifecycle
 
 The transport foundation for [controller-rs #2](https://github.com/variocube/controller-rs/issues/2)

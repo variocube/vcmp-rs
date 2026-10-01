@@ -13,6 +13,9 @@
 //!   requests use the configured deadline and dropping the waiter removes correlation state.
 //! - Incoming `MSG` frames are dispatched by their `@type` to a handler that runs **off the read
 //!   loop**, so long-running handlers never stall acknowledgements or heartbeats.
+//! - Every received frame gets an [`Arrival`] in receive order. A handler reads its message's arrival from
+//!   [`Session::arrival`], and [`Session::send_with_arrival`] returns the `ACK`'s, so a caller can
+//!   tell which of the two the peer sent first even though handlers run concurrently.
 //! - Heartbeats: whoever calls [`Session::initiate_heartbeat`] sends `HBT<interval>` and arms a
 //!   watchdog of 2 × interval; the receiver echoes it after `interval`. Missing a heartbeat closes
 //!   the session, which fails every pending send.
@@ -88,6 +91,29 @@ impl fmt::Debug for ConnectInfo {
 			.field("remote_addr", &self.remote_addr)
 			.field("headers", &"[redacted]")
 			.finish_non_exhaustive()
+	}
+}
+
+/// Where a received frame arrived: by session, then in receive order within the session.
+///
+/// Within one session, the order is the order in which the peer sent the frames. Sessions compare
+/// by creation, which matches receive order for sessions that do not overlap, such as the successive
+/// connections of one [`VcmpClient`](crate::VcmpClient).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Arrival {
+	session: u64,
+	frame: u64,
+}
+
+impl Arrival {
+	/// The id of the session that received the frame, see [`Session::id`].
+	pub fn session(&self) -> u64 {
+		self.session
+	}
+
+	/// The frame's position among the frames this session received, starting at 1.
+	pub fn frame(&self) -> u64 {
+		self.frame
 	}
 }
 
@@ -278,7 +304,7 @@ struct AdmittedSink<K> {
 	permits: Option<(Permit, Permit)>,
 }
 
-type PendingSender = oneshot::Sender<Result<Option<String>, VcmpError>>;
+type PendingSender = oneshot::Sender<Result<(Option<String>, Arrival), VcmpError>>;
 type PendingEntry = (PendingSender, (Permit, Permit));
 
 #[derive(Default)]
@@ -310,6 +336,8 @@ struct Inner {
 	heartbeat: Mutex<HeartbeatState>,
 	heartbeats_received: AtomicU64,
 	ignored_frames: AtomicU64,
+	/// Frames received so far. Only the read loop counts, so the count follows receive order.
+	frames_received: AtomicU64,
 }
 
 /// A VCMP session: one WebSocket connection with its pending sends and heartbeat state.
@@ -320,6 +348,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct Session {
 	inner: Arc<Inner>,
+	/// Where the message arrived, on the handle passed to its handler.
+	arrival: Option<Arrival>,
 }
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -375,7 +405,9 @@ impl Session {
 				heartbeat: Mutex::new(HeartbeatState { awaiting: true, ..Default::default() }),
 				heartbeats_received: AtomicU64::new(0),
 				ignored_frames: AtomicU64::new(0),
+				frames_received: AtomicU64::new(0),
 			}),
+			arrival: None,
 		};
 		let task_session = session.clone();
 		tokio::spawn(async move {
@@ -409,6 +441,12 @@ impl Session {
 	/// Whether the session is open, i.e. frames can be sent.
 	pub fn is_open(&self) -> bool {
 		self.inner.open.load(Ordering::SeqCst)
+	}
+
+	/// Where the message being handled arrived. Set only on the handle passed to a message handler,
+	/// and on its clones.
+	pub fn arrival(&self) -> Option<Arrival> {
+		self.arrival
 	}
 
 	/// The number of heartbeats received so far.
@@ -472,15 +510,24 @@ impl Session {
 	/// Unlike [`Session::send`], nothing is added: the value must carry its own `@type` member
 	/// for the peer to dispatch it. Meant for untyped messages such as [`serde_json::Value`].
 	pub async fn send_value<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
+		Ok(self.send_with_arrival(message).await?.0)
+	}
+
+	/// Like [`Session::send_value`], also returning where the `ACK` arrived. Compare it with a
+	/// handler's [`Session::arrival`] to learn whether the peer sent that message before or after
+	/// acknowledging this one.
+	pub async fn send_with_arrival<M: Serialize + ?Sized>(&self, message: &M) -> Result<(Value, Arrival), VcmpError> {
 		let payload = serialize_bounded(message, self.inner.limits.max_message_bytes.saturating_sub(15))?;
-		match self.send_payload(payload).await? {
-			None => Ok(Value::Null),
+		let (ack, arrival) = self.exchange(payload).await?;
+		let value = match ack {
+			None => Value::Null,
 			Some(ack) => serde_json::from_str(&ack).map_err(|error| {
 				VcmpError::internal("Invalid acknowledgement")
 					.with_detail("The ACK payload could not be parsed.")
 					.with_source(error)
-			}),
-		}
+			})?,
+		};
+		Ok((value, arrival))
 	}
 
 	/// Sends a `MSG` frame with the given raw payload and waits for the acknowledgement.
@@ -489,6 +536,11 @@ impl Session {
 	/// useful for tests that need to send malformed messages.
 	#[doc(hidden)]
 	pub async fn send_payload(&self, payload: String) -> Result<Option<String>, VcmpError> {
+		Ok(self.exchange(payload).await?.0)
+	}
+
+	/// Sends a `MSG` frame with the given raw payload and waits for the `ACK` and its arrival.
+	async fn exchange(&self, payload: String) -> Result<(Option<String>, Arrival), VcmpError> {
 		if payload.len().saturating_add(15) > self.inner.limits.max_message_bytes {
 			return Err(VcmpError::new(413, "Message too large"));
 		}
@@ -642,9 +694,9 @@ impl Session {
 		}
 	}
 
-	fn handle_ack(&self, id: &str, payload: Option<String>) {
+	fn handle_ack(&self, id: &str, payload: Option<String>, arrival: Arrival) {
 		if let Some(tx) = self.take_pending(id) {
-			let _ = tx.send(Ok(payload));
+			let _ = tx.send(Ok((payload, arrival)));
 		} else {
 			self.diagnose("late or unknown ACK");
 		}
@@ -672,7 +724,7 @@ impl Session {
 		self.inner.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(id).map(|(sender, _)| sender)
 	}
 
-	fn handle_message(&self, id: String, payload: String, tasks: &mut JoinSet<()>) {
+	fn handle_message(&self, id: String, payload: String, arrival: Arrival, tasks: &mut JoinSet<()>) {
 		let permits = match self.reserve(Resource::Handler, payload.len()) {
 			Ok(permits) => permits,
 			Err(error) => {
@@ -710,7 +762,7 @@ impl Session {
 			return;
 		};
 		// Run the handler off the read loop, so the session keeps processing ACKs and heartbeats.
-		let session = self.clone();
+		let session = Session { inner: self.inner.clone(), arrival: Some(arrival) };
 		tasks.spawn(async move {
 			let _permits = permits;
 			match tokio::time::timeout(session.inner.limits.handler_timeout, handler(message, session.clone())).await {
@@ -748,11 +800,13 @@ impl Session {
 			}
 		};
 		trace!(session = self.id(), bytes = raw.len(), "received frame");
+		let arrival =
+			Arrival { session: self.inner.id, frame: self.inner.frames_received.fetch_add(1, Ordering::Relaxed) + 1 };
 		match frame {
 			Frame::Heartbeat { interval } => self.handle_heartbeat(interval),
-			Frame::Ack { id, payload } => self.handle_ack(&id, payload),
+			Frame::Ack { id, payload } => self.handle_ack(&id, payload, arrival),
 			Frame::Nak { id, payload } => self.handle_nak(&id, payload),
-			Frame::Message { id, payload } => self.handle_message(id, payload, tasks),
+			Frame::Message { id, payload } => self.handle_message(id, payload, arrival, tasks),
 		}
 	}
 
