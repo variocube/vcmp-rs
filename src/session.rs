@@ -13,7 +13,7 @@
 //!   requests use the configured deadline and dropping the waiter removes correlation state.
 //! - Incoming `MSG` frames are dispatched by their `@type` to a handler that runs **off the read
 //!   loop**, so long-running handlers never stall acknowledgements or heartbeats.
-//! - Every received frame gets an [`Arrival`] in receive order. A handler reads its message's from
+//! - Every received frame gets an [`Arrival`] in receive order. A handler reads its message's arrival from
 //!   [`Session::arrival`], and [`Session::send_with_arrival`] returns the `ACK`'s, so a caller can
 //!   tell which of the two the peer sent first even though handlers run concurrently.
 //! - Heartbeats: whoever calls [`Session::initiate_heartbeat`] sends `HBT<interval>` and arms a
