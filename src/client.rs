@@ -424,6 +424,18 @@ impl VcmpClient {
 		self.current_session()?.send_value(message).await
 	}
 
+	/// Sends an untyped value on the current session with its own acknowledgement deadline.
+	/// See [`Session::send_value_timeout`].
+	///
+	/// Fails with `503 Not connected` when there is no session, like [`VcmpClient::send_value`].
+	pub async fn send_value_timeout<M: Serialize + ?Sized>(
+		&self,
+		message: &M,
+		timeout: Duration,
+	) -> Result<Value, VcmpError> {
+		self.current_session()?.send_value_timeout(message, timeout).await
+	}
+
 	fn current_session(&self) -> Result<Session, VcmpError> {
 		self.session().ok_or_else(|| VcmpError::not_connected("Cannot send message: the client has no session."))
 	}

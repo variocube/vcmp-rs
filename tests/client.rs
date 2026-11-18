@@ -42,6 +42,12 @@ async fn sends_and_receives_acknowledgements(host: ServerHost) {
 		assert!(!error.is_transport());
 	}
 
+	let message = serde_json::json!({"@type": "test:Never"});
+	let send = client.send_value_timeout(&message, Duration::from_millis(50));
+	let error = timeout(Duration::from_secs(1), send).await.unwrap().unwrap_err();
+	assert_eq!((error.status(), error.title()), (504, "Acknowledgement timed out"));
+	assert!(error.is_transport());
+
 	let error = client.send(&Unknown {}).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (500, "Message handling failed"));
 	assert!(!error.is_transport());
@@ -323,6 +329,9 @@ async fn keeps_retrying_when_the_server_is_unreachable_or_rejects(host: ServerHo
 async fn send_without_session_fails_with_not_connected() {
 	let client = VcmpClient::builder("ws://127.0.0.1:1/").build();
 	let error = client.send(&Void {}).await.unwrap_err();
+	assert_eq!((error.status(), error.title()), (503, "Not connected"));
+	assert!(error.is_transport());
+	let error = client.send_value_timeout(&serde_json::json!({}), Duration::from_secs(5)).await.unwrap_err();
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
 	assert!(error.is_transport());
 }

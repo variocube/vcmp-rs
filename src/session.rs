@@ -10,7 +10,8 @@
 //!   the `ACK` payload or a [`VcmpError`] (the peer's `NAK` problem detail, `503 Session not open`
 //!   when the session is not open at send time, or `503 Session closed` when the session closes
 //!   while the send is outstanding). Requests have a configured acknowledgement timeout:
-//!   requests use the configured deadline and dropping the waiter removes correlation state.
+//!   requests use the configured deadline, or their own with [`Session::send_value_timeout`], and
+//!   dropping the waiter removes correlation state.
 //! - Incoming `MSG` frames are dispatched by their `@type` to a handler that runs **off the read
 //!   loop**, so long-running handlers never stall acknowledgements or heartbeats.
 //! - Every received frame gets an [`Arrival`] in receive order. A handler reads its message's arrival from
@@ -483,10 +484,11 @@ impl Session {
 	/// detail, `503 Session not open` when the session is not open, or `503 Session closed` when
 	/// the session closes while the send is outstanding.
 	///
-	/// The configured request deadline applies. A local acknowledgement timeout returns `504`
-	/// with [`VcmpError::is_transport`] set to `true`; a peer NAK returns `false` for any status.
-	/// Timeout or disconnect leaves delivery and mutation outcome unknown; retries are caller policy.
-	/// Dropping this future removes retained correlation state.
+	/// The configured request deadline applies; [`Session::send_value_timeout`] sets one per request.
+	/// A local acknowledgement timeout returns `504` with [`VcmpError::is_transport`] set to `true`;
+	/// a peer NAK returns `false` for any status. Timeout or disconnect leaves delivery and mutation
+	/// outcome unknown; retries are caller policy. Dropping this future removes retained correlation
+	/// state.
 	pub async fn send<M: VcmpMessage>(&self, message: &M) -> Result<Value, VcmpError> {
 		self.send_value(&Tagged { type_: M::TYPE, message }).await
 	}
@@ -509,16 +511,46 @@ impl Session {
 	///
 	/// Unlike [`Session::send`], nothing is added: the value must carry its own `@type` member
 	/// for the peer to dispatch it. Meant for untyped messages such as [`serde_json::Value`].
+	/// The session's request deadline applies; [`Session::send_value_timeout`] sets one for this send.
 	pub async fn send_value<M: Serialize + ?Sized>(&self, message: &M) -> Result<Value, VcmpError> {
 		Ok(self.send_with_arrival(message).await?.0)
+	}
+
+	/// Like [`Session::send_value`], waiting at most `timeout` for the acknowledgement instead of
+	/// the session's [`SessionLimits::request_timeout`]. The deadline may be shorter or longer.
+	///
+	/// Meant for a session with a long or unbounded request deadline that still needs to bound
+	/// one send. On expiry the send fails with the same `504 Acknowledgement timed out` as the
+	/// session deadline, with [`VcmpError::is_transport`] set to `true` (kept by clones), and its
+	/// correlation state is removed, so a late `ACK` is ignored. Delivery and mutation outcome are
+	/// unknown then. Unlike a caller-side `tokio::time::timeout`, the error is VCMP's own. Every
+	/// other failure is that of [`Session::send_value`].
+	///
+	/// The timeout should be nonzero, like the durations of [`SessionLimits`]: a zero timeout still
+	/// sends the message and then fails with `504` at once.
+	pub async fn send_value_timeout<M: Serialize + ?Sized>(
+		&self,
+		message: &M,
+		timeout: Duration,
+	) -> Result<Value, VcmpError> {
+		Ok(self.send_until(message, timeout).await?.0)
 	}
 
 	/// Like [`Session::send_value`], also returning where the `ACK` arrived. Compare it with a
 	/// handler's [`Session::arrival`] to learn whether the peer sent that message before or after
 	/// acknowledging this one.
 	pub async fn send_with_arrival<M: Serialize + ?Sized>(&self, message: &M) -> Result<(Value, Arrival), VcmpError> {
+		self.send_until(message, self.inner.limits.request_timeout).await
+	}
+
+	/// Sends a value, waiting at most `timeout` for the `ACK` and its arrival.
+	async fn send_until<M: Serialize + ?Sized>(
+		&self,
+		message: &M,
+		timeout: Duration,
+	) -> Result<(Value, Arrival), VcmpError> {
 		let payload = serialize_bounded(message, self.inner.limits.max_message_bytes.saturating_sub(15))?;
-		let (ack, arrival) = self.exchange(payload).await?;
+		let (ack, arrival) = self.exchange(payload, timeout).await?;
 		let value = match ack {
 			None => Value::Null,
 			Some(ack) => serde_json::from_str(&ack).map_err(|error| {
@@ -536,11 +568,11 @@ impl Session {
 	/// useful for tests that need to send malformed messages.
 	#[doc(hidden)]
 	pub async fn send_payload(&self, payload: String) -> Result<Option<String>, VcmpError> {
-		Ok(self.exchange(payload).await?.0)
+		Ok(self.exchange(payload, self.inner.limits.request_timeout).await?.0)
 	}
 
-	/// Sends a `MSG` frame with the given raw payload and waits for the `ACK` and its arrival.
-	async fn exchange(&self, payload: String) -> Result<(Option<String>, Arrival), VcmpError> {
+	/// Sends a `MSG` frame with the given raw payload and waits at most `timeout` for the `ACK` and its arrival.
+	async fn exchange(&self, payload: String, timeout: Duration) -> Result<(Option<String>, Arrival), VcmpError> {
 		if payload.len().saturating_add(15) > self.inner.limits.max_message_bytes {
 			return Err(VcmpError::new(413, "Message too large"));
 		}
@@ -559,7 +591,7 @@ impl Session {
 		self.enqueue(frame.serialize(), false)?;
 		// Only the queued copy owns byte permits; do not retain the original payload while awaiting an ACK.
 		drop(frame);
-		match tokio::time::timeout(self.inner.limits.request_timeout, rx).await {
+		match tokio::time::timeout(timeout, rx).await {
 			Ok(Ok(result)) => result,
 			Ok(Err(_)) => Err(VcmpError::session_closed("The session closed before acknowledgement.")),
 			Err(_) => Err(VcmpError::acknowledgement_timeout()),

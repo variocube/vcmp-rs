@@ -41,7 +41,7 @@ Add it as a git dependency (not published to crates.io):
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.2" }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.3" }
 ```
 
 Feature flags: `client` (default), `server`, `axum` (includes `server`), `tls` (`wss://` via
@@ -101,6 +101,7 @@ client.start();                                                       // connect
 let result: serde_json::Value = client.send(&msg).await?;             // Result<Value, VcmpError>
 let typed: Ack = client.send_as::<_, Ack>(&msg).await?;               // deserialized result
 client.send_value(&serde_json::json!({"@type": "echo"})).await?;      // untyped: you supply @type
+client.send_value_timeout(&value, Duration::from_secs(5)).await?;     // untyped, own ACK deadline (504)
 tokio::time::timeout(Duration::from_secs(20), client.send(&msg)).await??;   // caller-side bound
 client.stop_and_wait().await;                                        // fails pending sends and bounds shutdown
 ```
@@ -135,7 +136,7 @@ listener and HTTP shutdown:
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.2", default-features = false, features = ["axum"] }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.3", default-features = false, features = ["axum"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 ```
@@ -214,7 +215,7 @@ Use `error.is_transport()` to identify transport failures detected by this VCMP 
 | Failure | `is_transport()` |
 | --- | --- |
 | No connection, session not open, or session closed (including write failures) | `true` |
-| Local acknowledgement timeout (`504 Acknowledgement timed out`) | `true` |
+| Local acknowledgement timeout (`504 Acknowledgement timed out`), session-wide or per request | `true` |
 | Local connection, pending-request, or outbound queue admission overload (`503`) | `true` |
 | A peer NAK, including `503`, `408`, or `504` | `false` |
 | Application error, serialization failure, oversized message, or invalid ACK payload | `false` |
@@ -230,6 +231,13 @@ Serialization and conversion to `ProblemDetail` retain only the problem detail. 
 wrapping a `ProblemDetail` cannot restore local transport origin, even from properties such as
 `vcmp-local-connection`. Forwarding a local failure as a NAK or an ACK result therefore carries no
 local classification to the receiving peer. The wire format is unchanged.
+
+A session that keeps a long or unbounded `request_timeout`, for example for minutes-long card payments, can still
+bound one send with `send_value_timeout(&message, timeout)` on `Session` or `VcmpClient`. The timeout replaces
+the session's deadline for that request and may be shorter or longer. On expiry the send fails with VCMP's own
+`504 Acknowledgement timed out`, classified as a local transport failure (also on clones), and the pending entry is
+removed like on the session-wide deadline, so a late `ACK` is ignored. A caller-side `tokio::time::timeout` instead
+yields its own `Elapsed`, and an error built from it with `VcmpError::new` is an application error.
 
 Retry policy belongs to the caller. A timeout or disconnect may occur after the peer processed the
 message, so transport classification does not make replay safe. Peer NAKs may also warrant retries
@@ -292,9 +300,10 @@ usage; connection admission is reported by the shared budget. Zero capacity deni
 channel storage uses at least one slot internally but cannot bypass that admission rule.
 
 Requests and handlers default to 30-second deadlines, individual writes and close flushing to
-five seconds. `session_limits` configures them; use positive durations. Oversized sends fail with
-413 before queueing, and serialization stops growing its output at the message bound. Oversized
-incoming frames disconnect. Queue/request admission returns 503 immediately. Handler admission
+five seconds. `session_limits` configures them; use positive durations. `send_value_timeout`
+replaces the request deadline for a single send. Oversized sends fail with 413 before queueing,
+and serialization stops growing its output at the message bound. Oversized incoming frames
+disconnect. Queue/request admission returns 503 immediately. Handler admission
 sends a 503 NAK; if a mandatory ACK/NAK/heartbeat cannot enter its reserved queue, the connection
 closes. No business history is silently retained or dropped: callers own durable delivery,
 reconciliation and resnapshot policies. Handler timeout is also an ambiguous mutation outcome.
