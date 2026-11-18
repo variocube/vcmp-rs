@@ -70,6 +70,43 @@ async fn dropped_and_timed_out_waiters_release_correlation_without_replay() {
 }
 
 #[tokio::test]
+async fn per_request_deadline_bounds_an_unbounded_session_and_releases_correlation() {
+	let budget = ResourceBudget::default();
+	let limits = SessionLimits { request_timeout: Duration::MAX, ..limits() };
+	let (session, peer, mut outgoing) = pair(SessionOptions { limits, budget: budget.clone(), ..Default::default() });
+	let message = json!({"@type": "mutate"});
+	let send = session.send_value_timeout(&message, Duration::from_millis(50));
+	let error = timeout(Duration::from_secs(1), send).await.unwrap().unwrap_err();
+	assert_eq!((error.status(), error.title()), (504, "Acknowledgement timed out"));
+	assert!(error.is_transport());
+	assert!(error.clone().is_transport());
+	assert_eq!(session.resources().pending_requests, 0);
+	assert_eq!(budget.snapshot().pending_requests, 0);
+	let Frame::Message { id, .. } = frame(&mut outgoing).await else { panic!("MSG expected") };
+	peer.unbounded_send(Frame::ack(id, None).serialize()).unwrap();
+	until(|| session.ignored_frames() == 1).await;
+	assert!(session.is_open());
+	session.close();
+	session.closed().await;
+}
+
+#[tokio::test]
+async fn per_request_deadline_may_outlast_the_session_deadline() {
+	let (session, peer, mut outgoing) = pair(SessionOptions { limits: limits(), ..Default::default() });
+	let task = tokio::spawn({
+		let session = session.clone();
+		async move { session.send_value_timeout(&json!({"@type": "slow"}), Duration::from_secs(5)).await }
+	});
+	let Frame::Message { id, .. } = frame(&mut outgoing).await else { panic!("MSG expected") };
+	// Past the session's 100 ms request deadline.
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	peer.unbounded_send(Frame::ack(id, Some("\"done\"".into())).serialize()).unwrap();
+	assert_eq!(timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap(), json!("done"));
+	session.close();
+	session.closed().await;
+}
+
+#[tokio::test]
 async fn shared_pending_request_limit_is_enforced_across_sessions() {
 	let budget = ResourceBudget::new(ResourceLimits { pending_requests: 1, ..Default::default() });
 	let (first, _peer, mut outgoing) = pair(SessionOptions { budget: budget.clone(), ..Default::default() });
