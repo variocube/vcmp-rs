@@ -177,6 +177,7 @@ impl ClientBuilder {
 		let (connected, _) = watch::channel(false);
 		VcmpClient {
 			inner: Arc::new(ClientInner {
+				log_url: redact_url(&self.url),
 				config: self,
 				handlers: Arc::new(HandlerMap::new()),
 				on_connected: Mutex::new(None),
@@ -214,6 +215,8 @@ enum Stop {
 
 struct ClientInner {
 	config: ClientBuilder,
+	/// The URL without userinfo, query and fragment; the only form of the URL that is ever logged.
+	log_url: String,
 	handlers: Arc<HandlerMap>,
 	on_connected: Mutex<Option<SessionHook>>,
 	on_disconnected: Mutex<Option<SessionHook>>,
@@ -323,7 +326,7 @@ impl VcmpClient {
 		let generation = state.generation;
 		let (stop_tx, stop_rx) = watch::channel(Stop::No);
 		state.stop = Some(stop_tx);
-		info!("starting client");
+		info!(url = %self.inner.log_url, "starting client");
 		let task = tokio::spawn(Self::run(self.inner.clone(), generation, stop_rx));
 		state.task = Some(ClientTask { abort: task.abort_handle(), completion: task.map(|_| ()).boxed().shared() });
 	}
@@ -337,7 +340,7 @@ impl VcmpClient {
 	fn stop_inner(&self) -> Option<ClientTask> {
 		let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
 		if state.running {
-			info!("stopping client");
+			info!(url = %self.inner.log_url, "stopping client");
 		}
 		Self::stop_locked(&mut state, Stop::Notify);
 		self.inner.connected.send_replace(false);
@@ -479,7 +482,7 @@ impl VcmpClient {
 					inner.set_session(generation, None);
 					let how = *stop.borrow();
 					if how != Stop::Quiet {
-						debug!("session closed");
+						debug!(url = %inner.log_url, "session closed");
 						if let Some(hook) = inner.disconnected_hook() {
 							if let Ok(_permit) = inner.config.transport.budget.reserve(Resource::Handler, 0) {
 								let _ =
@@ -489,27 +492,27 @@ impl VcmpClient {
 						}
 					}
 				}
-				Ok(Err(_error)) => {
+				Ok(Err(error)) => {
 					if attempt == 0 {
-						warn!("failed to connect");
+						warn!(url = %inner.log_url, error = %error, "failed to connect");
 					} else {
-						debug!(attempt, "failed to connect");
+						debug!(url = %inner.log_url, attempt, error = %error, "failed to connect");
 					}
 				}
-				Err(_) => warn!("timed out connecting"),
+				Err(_) => warn!(url = %inner.log_url, "timed out connecting"),
 			}
 			if *stop.borrow() != Stop::No {
 				break;
 			}
 			let delay = inner.config.backoff.delay(attempt);
 			attempt = attempt.saturating_add(1);
-			debug!(?delay, "scheduling reconnect");
+			debug!(url = %inner.log_url, ?delay, "scheduling reconnect");
 			tokio::select! {
 				_ = tokio::time::sleep(delay) => {}
 				_ = stop.changed() => break,
 			}
 		}
-		debug!("client task ended");
+		debug!(url = %inner.log_url, "client task ended");
 	}
 
 	async fn connect(inner: &Arc<ClientInner>) -> Result<Session, ConnectError> {
@@ -518,22 +521,22 @@ impl VcmpClient {
 			config.transport.budget.reserve(Resource::Connection, 0).map_err(|_| ConnectError::Overloaded)?;
 		let mut request = config.url.as_str().into_client_request()?;
 		for (name, value) in &config.headers {
-			let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConnectError::Header(name.clone()))?;
+			let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConnectError::HeaderName)?;
 			let value = HeaderValue::from_str(value).map_err(|_| ConnectError::Header(name.to_string()))?;
 			request.headers_mut().append(name, value);
 		}
 		if let Some(factory) = &config.headers_per_attempt {
 			for (name, value) in factory().await.map_err(|_| ConnectError::Credentials)? {
-				let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConnectError::Header(name))?;
+				let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ConnectError::HeaderName)?;
 				let value = HeaderValue::from_str(&value).map_err(|_| ConnectError::Header(name.to_string()))?;
 				request.headers_mut().insert(name, value);
 			}
 		}
-		debug!("connecting");
+		debug!(url = %inner.log_url, "connecting");
 		let (ws, _response) =
 			tokio_tungstenite::connect_async_with_config(request, Some(config.transport.websocket_config()), false)
 				.await?;
-		info!("connected");
+		info!(url = %inner.log_url, "connected");
 		let session = spawn_session(SessionOptions::new(inner.handlers.clone()), &config.transport, ws, connection);
 		Ok(session)
 	}
@@ -594,15 +597,83 @@ enum ConnectError {
 	Overloaded,
 	#[error("per-attempt credentials unavailable")]
 	Credentials,
+	/// The name is never echoed: an invalid name may be a misplaced credential.
+	#[error("invalid header name")]
+	HeaderName,
 	#[error("invalid header {0:?}")]
 	Header(String),
 	#[error(transparent)]
 	WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 }
 
+/// Reduces a URL to `scheme://host[:port]/path` for logging: userinfo, query and fragment may carry
+/// credentials and are dropped. An unparseable URL is never echoed.
+fn redact_url(url: &str) -> String {
+	const INVALID: &str = "[invalid url]";
+	let Some((scheme, rest)) = url.split_once("://") else {
+		return INVALID.into();
+	};
+	let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+	// Strip userinfo before parsing: everything up to the last '@' of the authority.
+	let authority = rest[..end].rsplit_once('@').map_or(&rest[..end], |(_, host)| host);
+	let tail = &rest[end..];
+	let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+	let candidate = format!("{scheme}://{authority}{}", &tail[..path_end]);
+	match candidate.parse::<tokio_tungstenite::tungstenite::http::Uri>() {
+		Ok(uri) if uri.scheme_str().is_some() && uri.authority().is_some() => {
+			let authority = uri.authority().map_or("", |a| a.as_str());
+			let path = uri.path();
+			format!("{}://{authority}{path}", uri.scheme_str().unwrap_or_default().to_ascii_lowercase())
+		}
+		_ => INVALID.into(),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn redacts_plain_url() {
+		assert_eq!(redact_url("ws://localhost:9000/drivers/keypad"), "ws://localhost:9000/drivers/keypad");
+	}
+
+	#[test]
+	fn redacts_userinfo_query_and_fragment() {
+		let url = "wss://user:secret@Host.Example:8443/api/cube/v2/vcmp?access_token=secret#frag";
+		let logged = redact_url(url);
+		assert_eq!(logged, "wss://Host.Example:8443/api/cube/v2/vcmp");
+		for leaked in ["user", "secret", "access_token", "frag"] {
+			assert!(!logged.contains(leaked), "{logged}");
+		}
+	}
+
+	#[test]
+	fn redacts_password_containing_at_sign() {
+		let logged = redact_url("ws://u:p@ss@host:1/x?q=1");
+		assert_eq!(logged, "ws://host:1/x");
+	}
+
+	#[test]
+	fn keeps_ipv6_brackets() {
+		assert_eq!(redact_url("ws://[::1]:9000/x"), "ws://[::1]:9000/x");
+		assert_eq!(redact_url("ws://u:p@[::1]:9000/x?a=b"), "ws://[::1]:9000/x");
+	}
+
+	#[test]
+	fn url_without_path_or_with_query_only() {
+		assert_eq!(redact_url("ws://host:1"), "ws://host:1/");
+		assert_eq!(redact_url("ws://host?token=secret"), "ws://host/");
+	}
+
+	#[test]
+	fn unparseable_url_is_never_echoed() {
+		for input in ["not a url with secret", "secret-token", "ws://user:secret@/x", "ws://ho st:1/secret"] {
+			let logged = redact_url(input);
+			assert_eq!(logged, "[invalid url]", "{input}");
+			assert!(!logged.contains("secret"));
+		}
+	}
 
 	#[test]
 	fn backoff_grows_and_caps() {

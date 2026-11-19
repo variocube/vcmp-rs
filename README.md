@@ -362,8 +362,11 @@ allocations. Each admitted WebSocket can additionally hold its bounded reassembl
 RSS, HTTP pre-upgrade resources, a bounded blocking/crypto worker pool and durable business queues
 remain host responsibilities. Handler and hook futures must yield: async cancellation cannot
 interrupt blocking code or undo a mutation already dispatched to another service. Do not spawn
-untracked work from these callbacks. Routine transport logs exclude payloads, URLs and credentials;
-`Debug` output redacts connection headers, paths/parameters and client URLs.
+untracked work from these callbacks. Routine transport logs exclude payloads and credentials;
+client log lines carry the connection URL with userinfo, query and fragment removed
+(`scheme://host[:port]/path`). The path is logged, so credentials belong in headers, userinfo or
+the query, never in the path. `Debug` output redacts connection headers, paths/parameters and
+client URLs.
 
 Executable coverage is in `tests/bounds.rs` (counts/bytes, non-ACKing peers, drop/deadline cleanup,
 control priority, stalled writes, oversized frames and old-handler cancellation),

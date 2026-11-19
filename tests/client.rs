@@ -545,3 +545,168 @@ async fn concurrent_stop_waiters_both_wait_for_the_close_hook() {
 	assert!(!client.is_connected());
 	server.stop().await;
 }
+
+/// Captures tracing output of the current thread into a buffer.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+	fn text(&self) -> String {
+		String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+	}
+
+	fn install(&self) -> tracing::subscriber::DefaultGuard {
+		let subscriber = tracing_subscriber::fmt()
+			.with_max_level(tracing::Level::DEBUG)
+			.with_ansi(false)
+			.with_writer(self.clone())
+			.finish();
+		tracing::subscriber::set_default(subscriber)
+	}
+
+	async fn wait_for(&self, needle: &str) -> String {
+		let result = timeout(Duration::from_secs(5), async {
+			loop {
+				let text = self.text();
+				if text.contains(needle) {
+					return text;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await;
+		result.unwrap_or_else(|_| panic!("log line {needle:?} not seen; log was:\n{}", self.text()))
+	}
+}
+
+impl std::io::Write for LogBuffer {
+	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+		self.0.lock().unwrap().extend_from_slice(buf);
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+	type Writer = LogBuffer;
+
+	fn make_writer(&'a self) -> Self::Writer {
+		self.clone()
+	}
+}
+
+fn line_with<'a>(log: &'a str, needle: &str) -> &'a str {
+	log.lines().find(|line| line.contains(needle)).unwrap_or_else(|| panic!("no {needle:?} line in:\n{log}"))
+}
+
+#[tokio::test]
+async fn logs_redacted_url_and_error_when_connect_fails() {
+	let logs = LogBuffer::default();
+	let _guard = logs.install();
+	let port = free_port();
+	let client = client(&format!("ws://user:pw@127.0.0.1:{port}/drivers/keypad?access_token=secret"));
+	client.start();
+
+	let log = logs.wait_for("failed to connect").await;
+	let line = line_with(&log, "failed to connect");
+	assert!(line.contains(&format!("url=ws://127.0.0.1:{port}/drivers/keypad")), "{line}");
+	assert!(line.contains("IO error"), "error missing: {line}");
+	assert!(!log.contains("secret") && !log.contains("pw@") && !log.contains("user:"), "{log}");
+
+	// The retry variant (attempt > 0) is logged at debug level and must carry the same fields.
+	let log = logs.wait_for("attempt=1").await;
+	let line = line_with(&log, "attempt=1");
+	assert!(line.contains("failed to connect"), "{line}");
+	assert!(line.contains(&format!("url=ws://127.0.0.1:{port}/drivers/keypad")), "{line}");
+	assert!(line.contains("IO error"), "error missing: {line}");
+	assert!(!log.contains("secret") && !log.contains("pw@") && !log.contains("user:"), "{log}");
+	client.stop();
+}
+
+#[tokio::test]
+async fn invalid_header_names_are_never_logged() {
+	let logs = LogBuffer::default();
+	let _guard = logs.install();
+	let port = free_port();
+	let url = format!("ws://127.0.0.1:{port}/x");
+	let fixed = VcmpClient::builder(url.clone())
+		.header("Authorization: Bearer tokenstatic", "v")
+		.reconnect(Backoff::fixed(Duration::from_millis(100)))
+		.build();
+	let per_attempt = VcmpClient::builder(url.clone())
+		.headers_per_attempt(|| async { Ok(vec![("Authorization: Bearer tokendynamic".to_string(), "v".to_string())]) })
+		.reconnect(Backoff::fixed(Duration::from_millis(100)))
+		.build();
+	let bad_value = VcmpClient::builder(url)
+		.header("X-Good", "line\nbreak")
+		.reconnect(Backoff::fixed(Duration::from_millis(100)))
+		.build();
+	for client in [&fixed, &per_attempt, &bad_value] {
+		client.start();
+	}
+
+	let log = logs.wait_for("invalid header \"x-good\"").await;
+	let log = timeout(Duration::from_secs(5), async {
+		while log_count(&logs.text(), "invalid header name") < 2 {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+		logs.text()
+	})
+	.await
+	.unwrap_or_else(|_| panic!("name errors not logged:\n{log}"));
+	assert!(!log.contains("tokenstatic") && !log.contains("tokendynamic") && !log.contains("Bearer"), "{log}");
+	for client in [&fixed, &per_attempt, &bad_value] {
+		client.stop();
+	}
+}
+
+fn log_count(log: &str, needle: &str) -> usize {
+	log.matches(needle).count()
+}
+
+#[tokio::test]
+async fn logs_redacted_url_when_connect_times_out() {
+	let logs = LogBuffer::default();
+	let _guard = logs.install();
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	let accepted = tokio::spawn(async move {
+		let mut held = Vec::new();
+		while let Ok((socket, _)) = listener.accept().await {
+			held.push(socket);
+		}
+	});
+	let client = VcmpClient::builder(format!("ws://user:pw@127.0.0.1:{port}/drivers/keypad?access_token=secret"))
+		.connect_timeout(Duration::from_millis(100))
+		.reconnect(Backoff::fixed(Duration::from_millis(100)))
+		.build();
+	client.start();
+
+	let log = logs.wait_for("timed out connecting").await;
+	let line = line_with(&log, "timed out connecting");
+	assert!(line.contains(&format!("url=ws://127.0.0.1:{port}/drivers/keypad")), "{line}");
+	assert!(!log.contains("secret") && !log.contains("pw@"), "{log}");
+	client.stop();
+	accepted.abort();
+}
+
+#[tokio::test]
+async fn logs_redacted_url_when_connected() {
+	let logs = LogBuffer::default();
+	let _guard = logs.install();
+	let (server, _endpoint) = start_hosted_server(ServerHost::Bare, 0, Duration::from_secs(20)).await;
+	let addr = server.local_addr();
+	let client = client(&format!("ws://user:pw@{addr}/test/a?access_token=secret"));
+	client.start();
+	connected(&client).await;
+
+	let log = logs.wait_for("vcmp::client: connected").await;
+	let line = line_with(&log, "vcmp::client: connected");
+	assert!(line.contains(&format!("url=ws://{addr}/test/a")), "{line}");
+	assert!(!log.contains("secret") && !log.contains("pw@"), "{log}");
+	client.stop();
+	server.stop().await;
+}
