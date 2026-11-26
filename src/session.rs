@@ -20,6 +20,12 @@
 //! - Heartbeats: whoever calls [`Session::initiate_heartbeat`] sends `HBT<interval>` and arms a
 //!   watchdog of 2 × interval; the receiver echoes it after `interval`. Missing a heartbeat closes
 //!   the session, which fails every pending send.
+//! - Authentication (`AUT`): a session spawned with [`SessionOptions::authenticator`] (feature
+//!   `server`) accepts only `HBT` and `AUT` until a credential was accepted; see [`auth`]. Without
+//!   one, an `AUT` is answered with `NAK` 400. [`Session::send_authentication`] is the client side.
+
+#[cfg(feature = "server")]
+pub mod auth;
 
 use crate::error::VcmpError;
 use crate::frame::Frame;
@@ -28,6 +34,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -66,6 +73,8 @@ pub trait VcmpMessage: Serialize + DeserializeOwned {
 pub struct ConnectInfo {
 	/// The request path (without query string).
 	pub path: String,
+	/// The query string of the request URI (without `?`), if any. May carry a credential: never log it.
+	pub query: Option<String>,
 	/// The path parameters of the matched route or endpoint, e.g. `driver` for `/drivers/{driver}`.
 	pub params: HashMap<String, String>,
 	/// The request headers, as sent (names lower-cased; non-UTF-8 values are lossily converted).
@@ -90,6 +99,7 @@ impl fmt::Debug for ConnectInfo {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("ConnectInfo")
 			.field("remote_addr", &self.remote_addr)
+			.field("query", &self.query.as_ref().map(|_| "[redacted]"))
 			.field("headers", &"[redacted]")
 			.finish_non_exhaustive()
 	}
@@ -285,6 +295,10 @@ pub struct SessionOptions {
 	pub limits: SessionLimits,
 	/// Shared process budget; clone the same budget into all transports to enforce global limits.
 	pub budget: ResourceBudget,
+	/// Requires the peer to authenticate the session (server side). `None`: an `AUT` is answered
+	/// with `NAK` 400 and the session is authenticated from the start.
+	#[cfg(feature = "server")]
+	pub authenticator: Option<auth::Authenticator>,
 }
 
 impl SessionOptions {
@@ -297,7 +311,39 @@ impl SessionOptions {
 struct Outgoing {
 	text: String,
 	_permits: (Permit, Permit),
+	/// Close the session once this frame was written (a `NAK` that ends the session).
+	close_after: bool,
 }
+
+/// Why a session was closed: the WebSocket close code and reason it sent to the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseReason {
+	/// The WebSocket close code, e.g. 1008 (policy violation) for authentication failures.
+	pub code: u16,
+	/// The close reason, informative only.
+	pub reason: Cow<'static, str>,
+}
+
+/// The close code a server uses for authentication failures (policy violation).
+pub const POLICY_VIOLATION: u16 = 1008;
+
+/// The close code a client uses when it closes a session for authentication reasons. Browsers only let
+/// clients close with 1000 or 3000–4999, so every VCMP client uses 4008; peers treat it like 1008.
+pub const CLIENT_POLICY_VIOLATION: u16 = 4008;
+
+pub(crate) type CloseSlot = Arc<Mutex<Option<CloseReason>>>;
+
+/// The longest close reason a close frame can carry (125 bytes of payload minus the code).
+const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// Whether an endpoint may send this close code (RFC 6455 §7.4).
+fn sendable_close_code(code: u16) -> bool {
+	matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
+/// What the WebSocket transport passes on for a binary message, which can't be a VCMP frame. It can't
+/// parse as a frame either, so it is never mistaken for one.
+pub(crate) const BINARY_MESSAGE: &str = "\0binary";
 
 struct AdmittedSink<K> {
 	// Drop buffered wire payloads before releasing their permits, including when the writer is aborted.
@@ -339,6 +385,14 @@ struct Inner {
 	ignored_frames: AtomicU64,
 	/// Frames received so far. Only the read loop counts, so the count follows receive order.
 	frames_received: AtomicU64,
+	/// Whether the session is authenticated; true from the start without an authenticator.
+	authenticated: watch::Sender<bool>,
+	/// The close code and reason sent to the peer, shared with the transport.
+	close_reason: CloseSlot,
+	/// The payload of the last `ACK` to an `AUT` this session sent (client side).
+	authentication: Mutex<Option<Value>>,
+	#[cfg(feature = "server")]
+	auth: Option<auth::ServerAuth>,
 }
 
 /// A VCMP session: one WebSocket connection with its pending sends and heartbeat state.
@@ -377,10 +431,16 @@ impl Session {
 		K::Error: fmt::Display,
 	{
 		let connection = options.budget.reserve(Resource::Connection, 0)?;
-		Ok(Self::spawn_admitted(options, stream, sink, connection))
+		Ok(Self::spawn_admitted(options, stream, sink, connection, CloseSlot::default()))
 	}
 
-	pub(crate) fn spawn_admitted<S, K>(options: SessionOptions, stream: S, sink: K, connection: Permit) -> Session
+	pub(crate) fn spawn_admitted<S, K>(
+		options: SessionOptions,
+		stream: S,
+		sink: K,
+		connection: Permit,
+		close_reason: CloseSlot,
+	) -> Session
 	where
 		S: Stream<Item = String> + Send + Unpin + 'static,
 		K: Sink<String> + Send + Unpin + 'static,
@@ -389,6 +449,12 @@ impl Session {
 		let (out_tx, out_rx) = mpsc::channel(options.limits.resources.queued_messages.max(1));
 		let (control_tx, control_rx) = mpsc::channel(options.limits.resources.control_messages.max(1));
 		let (closed, _) = watch::channel(false);
+		#[cfg(feature = "server")]
+		let auth = options.authenticator.map(auth::ServerAuth::new);
+		#[cfg(feature = "server")]
+		let authenticated = auth.is_none();
+		#[cfg(not(feature = "server"))]
+		let authenticated = true;
 		let session = Session {
 			inner: Arc::new(Inner {
 				id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
@@ -407,9 +473,18 @@ impl Session {
 				heartbeats_received: AtomicU64::new(0),
 				ignored_frames: AtomicU64::new(0),
 				frames_received: AtomicU64::new(0),
+				authenticated: watch::channel(authenticated).0,
+				close_reason,
+				authentication: Mutex::new(None),
+				#[cfg(feature = "server")]
+				auth,
 			}),
 			arrival: None,
 		};
+		#[cfg(feature = "server")]
+		if let Some(auth) = &session.inner.auth {
+			session.arm_authentication_timeout(auth);
+		}
 		let task_session = session.clone();
 		tokio::spawn(async move {
 			let _connection = connection;
@@ -442,6 +517,34 @@ impl Session {
 	/// Whether the session is open, i.e. frames can be sent.
 	pub fn is_open(&self) -> bool {
 		self.inner.open.load(Ordering::SeqCst)
+	}
+
+	/// Whether the session is authenticated. Always true for a session without
+	/// [`SessionOptions::authenticator`]; messages can be sent only on authenticated sessions.
+	pub fn is_authenticated(&self) -> bool {
+		*self.inner.authenticated.borrow()
+	}
+
+	/// Resolves with `true` once the session is authenticated, or with `false` once it closed
+	/// before that.
+	pub async fn authenticated(&self) -> bool {
+		let mut rx = self.inner.authenticated.subscribe();
+		tokio::select! {
+			biased;
+			result = rx.wait_for(|authenticated| *authenticated) => result.is_ok(),
+			_ = self.closed() => self.is_authenticated(),
+		}
+	}
+
+	/// The payload of the last `ACK` to an `AUT` sent with [`Session::send_authentication`]
+	/// ([`Value::Null`] for an `ACK` without payload); `None` before one was acknowledged.
+	pub fn authentication(&self) -> Option<Value> {
+		self.inner.authentication.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// The close code and reason this session sent to its peer, if it closed with one.
+	pub fn close_reason(&self) -> Option<CloseReason> {
+		self.inner.close_reason.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
 	/// Where the message being handled arrived. Set only on the handle passed to a message handler,
@@ -573,11 +676,56 @@ impl Session {
 
 	/// Sends a `MSG` frame with the given raw payload and waits at most `timeout` for the `ACK` and its arrival.
 	async fn exchange(&self, payload: String, timeout: Duration) -> Result<(Option<String>, Arrival), VcmpError> {
-		if payload.len().saturating_add(15) > self.inner.limits.max_message_bytes {
+		if !self.is_authenticated() {
+			// Server side: nothing reaches a session before it is authenticated.
+			return Err(VcmpError::session_not_open("Cannot send message: the session is not authenticated."));
+		}
+		self.exchange_frame(Frame::message(payload), timeout).await
+	}
+
+	/// Authenticates this session with its peer (client side): sends an `AUT` frame with the
+	/// credential and waits at most `timeout` for the answer.
+	///
+	/// Resolves with the `ACK` payload ([`Value::Null`] without one, or when it is not a JSON object; an
+	/// invalid `expiresIn` is removed), which is also kept as
+	/// [`Session::authentication`]. Fails with the peer's `NAK` (`400`, `401` or `403`), `400` when
+	/// the credential is not a JSON object, or a local transport error such as
+	/// `504 Acknowledgement timed out` when the peer does not answer (an older peer that does not
+	/// know `AUT`). The credential is never logged.
+	pub async fn send_authentication(&self, credential: &Value, timeout: Duration) -> Result<Value, VcmpError> {
+		if !credential.is_object() {
+			return Err(
+				VcmpError::bad_request("Invalid credential").with_detail("The credential must be a JSON object.")
+			);
+		}
+		let payload = serialize_bounded(credential, self.inner.limits.max_message_bytes.saturating_sub(15))?;
+		let (ack, _) = self.exchange_frame(Frame::authenticate(payload), timeout).await?;
+		// #34 "Malformed ACK": a payload that is not a JSON object counts as no payload, an expiresIn that
+		// is not a non-negative integer as absent; the session is authenticated either way.
+		let value = match ack.map(|ack| serde_json::from_str::<Value>(&ack)) {
+			None => Value::Null,
+			Some(Ok(Value::Object(mut ack))) => {
+				if ack.get("expiresIn").is_some_and(|expires_in| expires_in.as_u64().is_none()) {
+					warn!(session = self.id(), "ignoring an invalid expiresIn in the authentication ACK");
+					ack.remove("expiresIn");
+				}
+				Value::Object(ack)
+			}
+			Some(_) => {
+				warn!(session = self.id(), "ignoring an authentication ACK payload that is not a JSON object");
+				Value::Null
+			}
+		};
+		*self.inner.authentication.lock().unwrap_or_else(|e| e.into_inner()) = Some(value.clone());
+		Ok(value)
+	}
+
+	/// Sends a `MSG` or `AUT` frame and waits at most `timeout` for the `ACK` and its arrival.
+	async fn exchange_frame(&self, frame: Frame, timeout: Duration) -> Result<(Option<String>, Arrival), VcmpError> {
+		if frame.serialize_len() > self.inner.limits.max_message_bytes {
 			return Err(VcmpError::new(413, "Message too large"));
 		}
 		let permits = self.reserve(Resource::Request, 0)?;
-		let frame = Frame::message(payload);
 		let id = frame.id().expect("message frames have an id").to_owned();
 		let (tx, rx) = oneshot::channel();
 		{
@@ -588,10 +736,12 @@ impl Session {
 			pending.insert(id.clone(), (tx, permits));
 		}
 		let _cleanup = PendingCleanup { session: self.clone(), id };
+		// Arm the answer timer before the frame can reach the transport.
+		let deadline = tokio::time::Instant::now() + timeout;
 		self.enqueue(frame.serialize(), false)?;
 		// Only the queued copy owns byte permits; do not retain the original payload while awaiting an ACK.
 		drop(frame);
-		match tokio::time::timeout(timeout, rx).await {
+		match tokio::time::timeout_at(deadline, rx).await {
 			Ok(Ok(result)) => result,
 			Ok(Err(_)) => Err(VcmpError::session_closed("The session closed before acknowledgement.")),
 			Err(_) => Err(VcmpError::acknowledgement_timeout()),
@@ -630,6 +780,47 @@ impl Session {
 		}
 	}
 
+	/// Closes the session with a WebSocket close code and reason (e.g. [`POLICY_VIOLATION`]).
+	/// The first code set wins; see [`Session::close`].
+	///
+	/// The reason is truncated to 123 bytes (at a character boundary), the most a close frame can
+	/// carry. A code that may not be sent (outside 1000–1003, 1007–1014 and 3000–4999, e.g. 1005,
+	/// 1006 or 1015) is not: the session closes without a code then, as with [`Session::close`].
+	pub fn close_with(&self, code: u16, reason: impl Into<Cow<'static, str>>) {
+		if sendable_close_code(code) {
+			let mut reason = reason.into();
+			if reason.len() > MAX_CLOSE_REASON_BYTES {
+				let mut end = MAX_CLOSE_REASON_BYTES;
+				while !reason.is_char_boundary(end) {
+					end -= 1;
+				}
+				reason = Cow::Owned(reason[..end].to_owned());
+			}
+			self.set_close_reason(code, reason);
+		} else {
+			warn!(session = self.id(), code, "not sending a close code that may not be sent");
+		}
+		self.close();
+	}
+
+	fn set_close_reason(&self, code: u16, reason: Cow<'static, str>) {
+		let mut slot = self.inner.close_reason.lock().unwrap_or_else(|e| e.into_inner());
+		if slot.is_none() && self.is_open() {
+			*slot = Some(CloseReason { code, reason });
+		}
+	}
+
+	/// Sends a `NAK` and closes the session with the given code once it was written. Closes at
+	/// once when the `NAK` cannot be queued.
+	#[cfg_attr(not(feature = "server"), allow(dead_code))]
+	fn nak_and_close(&self, id: &str, error: &VcmpError, code: u16, reason: &'static str) {
+		self.set_close_reason(code, Cow::Borrowed(reason));
+		let text = Frame::nak(id, Some(problem_payload(error))).serialize();
+		if self.enqueue_with(text, true, true).is_err() {
+			self.close();
+		}
+	}
+
 	/// Closes the session. Every pending send fails with `503 Session closed`. Idempotent.
 	pub fn close(&self) {
 		if self.inner.open.swap(false, Ordering::SeqCst) {
@@ -641,11 +832,19 @@ impl Session {
 	/// Sends a raw text frame. Returns whether the frame was handed to the transport.
 	#[doc(hidden)]
 	pub fn send_raw(&self, raw: String) -> bool {
-		let control = !raw.starts_with("MSG");
+		let message = raw.starts_with("MSG");
+		if message && !self.is_authenticated() {
+			return false;
+		}
+		let control = !message && !raw.starts_with("AUT");
 		self.enqueue(raw, control).is_ok()
 	}
 
 	fn enqueue(&self, text: String, control: bool) -> Result<(), VcmpError> {
+		self.enqueue_with(text, control, false)
+	}
+
+	fn enqueue_with(&self, text: String, control: bool, close_after: bool) -> Result<(), VcmpError> {
 		if !self.is_open() {
 			return Err(VcmpError::session_not_open("The session is not open."));
 		}
@@ -655,7 +854,7 @@ impl Session {
 		let resource = if control { Resource::Control } else { Resource::Data };
 		let permits = self.reserve(resource, text.len())?;
 		let tx = if control { &self.inner.control_tx } else { &self.inner.out_tx };
-		tx.try_send(Outgoing { text, _permits: permits }).map_err(|_| VcmpError::transport_overloaded())
+		tx.try_send(Outgoing { text, _permits: permits, close_after }).map_err(|_| VcmpError::transport_overloaded())
 	}
 
 	fn write(&self, frame: Frame) -> bool {
@@ -808,18 +1007,22 @@ impl Session {
 	}
 
 	fn nak(&self, id: &str, error: &VcmpError) {
-		let payload = serde_json::to_string(error).unwrap_or_else(|serialization_error| {
-			let _ = serialization_error;
-			let fallback = VcmpError::internal("Message handling failed")
-				.with_detail("The handler error could not be serialized.");
-			serde_json::to_string(&fallback).expect("a plain problem detail serializes")
-		});
-		self.write(Frame::nak(id, Some(payload)));
+		self.write(Frame::nak(id, Some(problem_payload(error))));
 	}
 
 	fn handle_incoming(&self, raw: String, tasks: &mut JoinSet<()>) {
 		if raw.len() > self.inner.limits.max_message_bytes {
 			self.close();
+			return;
+		}
+		#[cfg(feature = "server")]
+		if let Some(auth) = &self.inner.auth {
+			if !self.admit_raw(auth, &raw) {
+				return;
+			}
+		}
+		if raw == BINARY_MESSAGE {
+			// Unsupported binary messages are dropped (handled above while authentication is pending).
 			return;
 		}
 		let frame = match Frame::parse(&raw) {
@@ -831,14 +1034,34 @@ impl Session {
 				return;
 			}
 		};
-		trace!(session = self.id(), bytes = raw.len(), "received frame");
+		// Never log an AUT payload: it is a credential.
+		trace!(session = self.id(), kind = frame.kind(), bytes = raw.len(), "received frame");
 		let arrival =
 			Arrival { session: self.inner.id, frame: self.inner.frames_received.fetch_add(1, Ordering::Relaxed) + 1 };
+		#[cfg(feature = "server")]
+		if let Some(auth) = &self.inner.auth {
+			let Some(frame) = self.admit(auth, frame, tasks) else {
+				return;
+			};
+			return self.dispatch(frame, arrival, tasks);
+		}
+		self.dispatch(frame, arrival, tasks);
+	}
+
+	fn dispatch(&self, frame: Frame, arrival: Arrival, tasks: &mut JoinSet<()>) {
 		match frame {
 			Frame::Heartbeat { interval } => self.handle_heartbeat(interval),
 			Frame::Ack { id, payload } => self.handle_ack(&id, payload, arrival),
 			Frame::Nak { id, payload } => self.handle_nak(&id, payload),
 			Frame::Message { id, payload } => self.handle_message(id, payload, arrival, tasks),
+			Frame::Authenticate { id, .. } => {
+				// This side does not require authentication (a client, or an endpoint without the opt-in).
+				self.nak(
+					&id,
+					&VcmpError::bad_request("Authentication not supported")
+						.with_detail("This endpoint does not require authentication."),
+				);
+			}
 		}
 	}
 
@@ -870,6 +1093,7 @@ impl Session {
 				if !writer_session.is_open() {
 					break;
 				}
+				let close_after = outgoing.close_after;
 				transport.permits = Some(outgoing._permits);
 				let result = tokio::select! {
 					_ = closing.changed() => break,
@@ -881,19 +1105,32 @@ impl Session {
 					break;
 				}
 				transport.permits = None;
+				if close_after {
+					writer_session.close();
+					break;
+				}
 			}
 			let _ = tokio::time::timeout(writer_session.inner.limits.shutdown_timeout, transport.sink.close()).await;
 		});
 		let mut tasks = JoinSet::new();
-		loop {
-			tokio::select! {
-				biased;
-				_ = self.inner.close_requested.notified() => break,
-				_ = tasks.join_next(), if !tasks.is_empty() => {},
-				incoming = stream.next() => match incoming {
-					Some(text) => self.handle_incoming(text, &mut tasks),
-					None => break,
-				},
+		#[cfg(feature = "server")]
+		let reading = match &self.inner.auth {
+			Some(auth) => self.start_authentication(auth).await,
+			None => true,
+		};
+		#[cfg(not(feature = "server"))]
+		let reading = true;
+		if reading {
+			loop {
+				tokio::select! {
+					biased;
+					_ = self.inner.close_requested.notified() => break,
+					_ = tasks.join_next(), if !tasks.is_empty() => {},
+					incoming = stream.next() => match incoming {
+						Some(text) => self.handle_incoming(text, &mut tasks),
+						None => break,
+					},
+				}
 			}
 		}
 		drop(stream);
@@ -920,6 +1157,10 @@ impl Session {
 				echo.abort();
 			}
 		}
+		#[cfg(feature = "server")]
+		if let Some(auth) = &self.inner.auth {
+			auth.finish();
+		}
 		let pending: Vec<_> = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner()).drain().collect();
 		if !pending.is_empty() {
 			warn!(session = self.id(), count = pending.len(), "failing pending messages: session closed");
@@ -940,6 +1181,16 @@ struct Tagged<'a, M: Serialize> {
 	type_: &'static str,
 	#[serde(flatten)]
 	message: &'a M,
+}
+
+/// A problem detail as `NAK` payload.
+fn problem_payload(error: &VcmpError) -> String {
+	serde_json::to_string(error).unwrap_or_else(|serialization_error| {
+		let _ = serialization_error;
+		let fallback =
+			VcmpError::internal("Message handling failed").with_detail("The handler error could not be serialized.");
+		serde_json::to_string(&fallback).expect("a plain problem detail serializes")
+	})
 }
 
 fn serialize_bounded<M: Serialize + ?Sized>(message: &M, limit: usize) -> Result<String, VcmpError> {

@@ -1,6 +1,6 @@
 [package]
 name = "vcmp"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Variocube Messaging Protocol (VCMP) — wire-compatible Rust client and server"
@@ -39,7 +39,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 [dev-dependencies]
 futures-channel = { version = "0.3", features = ["sink"] }
 proptest = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "process", "io-util", "signal", "test-util"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
@@ -62,6 +62,18 @@ required-features = ["client", "server"]
 
 [[test]]
 name = "server"
+required-features = ["client", "server"]
+
+[[test]]
+name = "auth_session"
+required-features = ["client", "server"]
+
+[[test]]
+name = "auth_logging"
+required-features = ["client", "server"]
+
+[[test]]
+name = "auth_socket"
 required-features = ["client", "server"]
 
 [[test]]

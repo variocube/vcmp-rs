@@ -28,6 +28,27 @@ async fn js_server(port: u16, heartbeat_ms: u64) -> PeerProcess {
 	peer
 }
 
+async fn js_auth_server(port: u16) -> PeerProcess {
+	let peer = PeerProcess::spawn(node(&["server-auth", &port.to_string(), "20000"])).await;
+	peer.wait_for("READY", 1).await;
+	peer
+}
+
+/// A js client: with `credentials` (a JSON array) it authenticates with AUT, else it is an old client.
+async fn js_auth_client(url: String, credentials: Option<serde_json::Value>, hello: bool) -> PeerProcess {
+	let credentials = credentials.map(|credentials| credentials.to_string());
+	let mut args = match &credentials {
+		Some(credentials) => vec!["client-auth", url.as_str(), credentials.as_str()],
+		None => vec!["client", url.as_str()],
+	};
+	if hello {
+		args.push("--hello");
+	}
+	let peer = PeerProcess::spawn(node(&args)).await;
+	peer.wait_for("READY", 1).await;
+	peer
+}
+
 async fn js_client(url: &str) -> PeerProcess {
 	let peer = PeerProcess::spawn(node(&["client", url])).await;
 	peer.wait_for("READY", 1).await;
@@ -134,4 +155,41 @@ async fn server_against_js_client(host: ServerHost) {
 	client.wait_for("DISCONNECTED", 2).await;
 	client.kill().await;
 	server.stop().await;
+}
+
+// Session authentication (AUT), contract cases 1–11 of variocube/vcmp-spring#34, see tests/contract/auth.rs.
+
+#[tokio::test]
+#[ignore = "needs node and the vcmp-js packages"]
+async fn aut_against_js_server() {
+	init_tracing();
+	let (auth_port, open_port) = (free_port(), free_port());
+	let mut auth = js_auth_server(auth_port).await;
+	let mut open = js_server(open_port, 20000).await;
+	let target = auth::AuthTarget {
+		auth: format!("ws://127.0.0.1:{auth_port}/auth/raw"),
+		open: format!("ws://127.0.0.1:{open_port}/peer/raw"),
+	};
+	auth::raw_against_peer_server(&target).await;
+	auth::rust_client_against_peer_server(&target).await;
+	auth.kill().await;
+	open.kill().await;
+}
+
+#[tokio::test]
+#[ignore = "needs node and the vcmp-js packages"]
+async fn aut_js_client_against_rust_server() {
+	init_tracing();
+	auth::peer_client_against_rust_server(ServerHost::Bare, &|url, credentials, hello| {
+		Box::pin(js_auth_client(url, credentials, hello))
+	})
+	.await;
+}
+
+#[tokio::test]
+#[ignore = "needs node and the vcmp-js packages"]
+async fn aut_js_client_closes_with_4008() {
+	init_tracing();
+	auth::peer_client_closes_with_4008(&|url, credentials, hello| Box::pin(js_auth_client(url, credentials, hello)))
+		.await;
 }

@@ -16,10 +16,24 @@
 //! session closes, until [`VcmpClient::stop`]. The server initiates the heartbeat; the client
 //! expects the first `HBT` within [`ClientBuilder::initial_heartbeat_timeout`] and closes (and
 //! reconnects) otherwise, so a half-open connection never leaves sends pending forever.
+//!
+//! Session authentication (`AUT`): with [`ClientBuilder::authenticate`], the client fetches a
+//! credential on every connection and sends it as the first frame. It counts as
+//! connected — [`VcmpClient::on_connected`], [`VcmpClient::wait_connected`], sends — only after the
+//! server's `ACK`. A `NAK`, a failing credential provider, or no answer within
+//! [`ClientBuilder::auth_timeout`] (an older server that does not know `AUT`) is reported to
+//! [`VcmpClient::on_auth_error`]; the client then closes the session itself (close code 4008,
+//! [`crate::CLIENT_POLICY_VIOLATION`]) and reconnects under the normal backoff, with a fresh credential.
+//!
+//! The application triggers re-authentication: [`VcmpClient::reauthenticate`] asks the provider and
+//! sends one `AUT` on the open session, e.g. from the callback of its token library when the token was
+//! refreshed. The client schedules nothing itself; it passes the `ACK` payload (with `expiresIn`) to the
+//! application ([`Session::authentication`]). An application that never re-authenticates loses the
+//! session at its expiry (the server closes it) and the client reconnects with a fresh credential.
 
 use crate::error::VcmpError;
 use crate::resources::Resource;
-use crate::session::{HandlerMap, Session, SessionOptions, VcmpMessage};
+use crate::session::{CLIENT_POLICY_VIOLATION, HandlerMap, Session, SessionOptions, VcmpMessage};
 use crate::ws::{TransportOptions, spawn_session};
 use crate::{ResourceBudget, SessionLimits};
 use futures_util::{FutureExt, future::Shared};
@@ -28,11 +42,13 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tracing::{debug, info, warn};
@@ -92,6 +108,37 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type SessionHook = Arc<dyn Fn(Session) -> BoxFuture + Send + Sync>;
 type HeaderFuture = Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, VcmpError>> + Send>>;
 type HeaderFactory = Arc<dyn Fn() -> HeaderFuture + Send + Sync>;
+type CredentialFuture = Pin<Box<dyn Future<Output = Result<Value, VcmpError>> + Send>>;
+type CredentialProvider = Arc<dyn Fn() -> CredentialFuture + Send + Sync>;
+type Reauthentication = Shared<Pin<Box<dyn Future<Output = Result<Option<Value>, VcmpError>> + Send>>>;
+type ErrorHook = Arc<dyn Fn(VcmpError) -> BoxFuture + Send + Sync>;
+
+/// The default time the server has to answer an `AUT`.
+pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const FAILED_REASON: &str = "authentication failed";
+const TIMEOUT_REASON: &str = "authentication timeout";
+
+/// A failed credential provider (an error, a panic, or no JSON object): `500` (#34).
+fn provider_failed(detail: &str) -> VcmpError {
+	VcmpError::internal("Credential unavailable").with_detail(detail)
+}
+
+/// The smallest answer timeout a client accepts.
+pub const MIN_AUTH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Why authenticating a session (first `AUT` or re-authentication) failed.
+enum AuthFailure {
+	/// The server answered with `NAK`.
+	Nak(VcmpError),
+	/// The credential provider failed or returned no JSON object: close `authentication failed`.
+	Failed(VcmpError),
+	/// The provider did not complete within the answer timeout; nothing was sent.
+	ProviderTimeout(VcmpError),
+	/// The sent `AUT` was not answered within the answer timeout: close `authentication timeout`.
+	Timeout(VcmpError),
+	/// The session closed meanwhile (or the client is stopping).
+	Closed(Option<VcmpError>),
+}
 
 /// Configures a [`VcmpClient`].
 #[derive(Clone)]
@@ -103,9 +150,40 @@ pub struct ClientBuilder {
 	initial_heartbeat_timeout: Duration,
 	connect_timeout: Duration,
 	transport: TransportOptions,
+	authenticate: Option<CredentialProvider>,
+	auth_timeout: Duration,
 }
 
 impl ClientBuilder {
+	/// Authenticates every session with an `AUT` frame carrying the credential the provider returns,
+	/// a JSON object whose shape the endpoint defines (e.g. `{"token": "…"}`).
+	///
+	/// The provider is called on every connection, once the WebSocket is open, and on every
+	/// [`VcmpClient::reauthenticate`], so it can fetch a fresh token. The answer timeout ([`ClientBuilder::auth_timeout`])
+	/// starts when it is called. A provider error or panic, or a credential that is not a JSON object,
+	/// is an authentication error (`500`, [`VcmpClient::on_auth_error`]); on connect the session is
+	/// closed (4008 `authentication failed`) and the client reconnects with backoff.
+	pub fn authenticate<F, Fut>(mut self, provider: F) -> Self
+	where
+		F: Fn() -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Value, VcmpError>> + Send + 'static,
+	{
+		self.authenticate = Some(Arc::new(move || Box::pin(provider())));
+		self
+	}
+
+	/// The time from calling the credential provider until the server's answer to the `AUT`.
+	/// Default: 10 s.
+	///
+	/// # Panics
+	///
+	/// When `timeout` is shorter than [`MIN_AUTH_INTERVAL`] (1 s): a configuration error.
+	pub fn auth_timeout(mut self, timeout: Duration) -> Self {
+		assert!(timeout >= MIN_AUTH_INTERVAL, "the authentication answer timeout must be at least 1 s");
+		self.auth_timeout = timeout;
+		self
+	}
+
 	/// Adds a header to the WebSocket handshake request (e.g. `Authorization`).
 	pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
 		self.headers.push((name.into(), value.into()));
@@ -182,6 +260,9 @@ impl ClientBuilder {
 				handlers: Arc::new(HandlerMap::new()),
 				on_connected: Mutex::new(None),
 				on_disconnected: Mutex::new(None),
+				on_auth_error: Mutex::new(None),
+				aut: tokio::sync::Mutex::new(()),
+				reauthentication: Mutex::new(None),
 				state: Mutex::new(ClientState::default()),
 				connected,
 			}),
@@ -220,6 +301,12 @@ struct ClientInner {
 	handlers: Arc<HandlerMap>,
 	on_connected: Mutex<Option<SessionHook>>,
 	on_disconnected: Mutex<Option<SessionHook>>,
+	on_auth_error: Mutex<Option<ErrorHook>>,
+	/// Held while an `AUT` is in flight (the first one until the session is published, or a
+	/// re-authentication): one at a time per client.
+	aut: tokio::sync::Mutex<()>,
+	/// The re-authentication that calls made now join: it runs once the `AUT` in flight is answered.
+	reauthentication: Mutex<Option<Reauthentication>>,
 	state: Mutex<ClientState>,
 	connected: watch::Sender<bool>,
 }
@@ -243,6 +330,8 @@ impl VcmpClient {
 			initial_heartbeat_timeout: Duration::from_secs(60),
 			connect_timeout: Duration::from_secs(30),
 			transport: TransportOptions::default(),
+			authenticate: None,
+			auth_timeout: DEFAULT_AUTH_TIMEOUT,
 		}
 	}
 
@@ -307,6 +396,70 @@ impl VcmpClient {
 		*self.inner.on_disconnected.lock().unwrap_or_else(|e| e.into_inner()) =
 			Some(Arc::new(move |session| Box::pin(hook(session))));
 		self
+	}
+
+	/// Sets the hook that runs when authenticating a session failed (on connect and for
+	/// [`VcmpClient::reauthenticate`]), with the error's status (#34):
+	///
+	/// - the server's `NAK`, its status passed through (`400`, `401`, `403`, `500`, `503`);
+	/// - `500 Credential unavailable`: the credential provider failed (an error, a panic, or no JSON object);
+	/// - `504 Acknowledgement timed out`: the provider did not complete, or the `AUT` was not answered,
+	///   within the answer timeout (e.g. an older server that does not know `AUT`);
+	/// - `503`: the session closed while the `AUT` was pending (e.g. an older server that closes on it).
+	///
+	/// On connect the session is then closed (4008) and the client reconnects with backoff; for
+	/// [`VcmpClient::reauthenticate`] see there. The hook may call [`VcmpClient::reauthenticate`].
+	pub fn on_auth_error<F, Fut>(&self, hook: F) -> &Self
+	where
+		F: Fn(VcmpError) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = ()> + Send + 'static,
+	{
+		*self.inner.on_auth_error.lock().unwrap_or_else(|e| e.into_inner()) =
+			Some(Arc::new(move |error| Box::pin(hook(error))));
+		self
+	}
+
+	/// Re-authenticates the current session: asks the credential provider and sends one `AUT`.
+	/// Call it when the application's credential was renewed (e.g. from its token library's refresh
+	/// callback); the client schedules nothing itself.
+	///
+	/// Resolves with:
+	/// - `Ok(Some(ack))`: the `ACK` payload (also [`Session::authentication`]), with `expiresIn` if the
+	///   authentication expires.
+	/// - `Ok(None)`: nothing was sent, because there is no authenticated session (connecting, first
+	///   `AUT` pending without a session to follow, disconnected, or no [`ClientBuilder::authenticate`]):
+	///   the next connect asks the provider anyway.
+	/// - `Err(error)`, also reported to [`VcmpClient::on_auth_error`]:
+	///   - the server's `NAK` (its status): the session stays (until its current expiry), nothing is
+	///     retried; call again. On a principal change the server closes the session.
+	///   - `500` (the provider failed) or `504` (it did not complete within the answer timeout): nothing
+	///     was sent, the session stays.
+	///   - `504 Acknowledgement timed out`: the `AUT` was not answered in time; the client closes the
+	///     session (4008 `authentication timeout`) and reconnects.
+	///   - `503`: the session closed while the `AUT` was pending.
+	///
+	/// Only one `AUT` is in flight at a time: calls made while one is pending (the first one, or a
+	/// re-authentication) are served together by a single further `AUT` after its answer, with a fresh
+	/// credential. The re-authentication runs to its end even if every caller stops waiting.
+	pub async fn reauthenticate(&self) -> Result<Option<Value>, VcmpError> {
+		if self.inner.config.authenticate.is_none() {
+			return Ok(None);
+		}
+		let reauthentication = {
+			let mut next = self.inner.reauthentication.lock().unwrap_or_else(|e| e.into_inner());
+			next.get_or_insert_with(|| {
+				let task = tokio::spawn(Self::reauthenticate_once(self.inner.clone()));
+				let joined: Pin<Box<dyn Future<Output = Result<Option<Value>, VcmpError>> + Send>> =
+					Box::pin(async move {
+						task.await.unwrap_or_else(|_| {
+							Err(VcmpError::internal("Re-authentication failed").with_detail("The task was cancelled."))
+						})
+					});
+				joined.shared()
+			})
+			.clone()
+		};
+		reauthentication.await
 	}
 
 	/// Connects and keeps the connection alive until [`VcmpClient::stop`].
@@ -453,14 +606,64 @@ impl VcmpClient {
 			};
 			match connected {
 				Ok(Ok(session)) => {
-					attempt = 0;
 					let _session_guard = CloseOnDrop(session.clone());
-					if !inner.set_session(generation, Some(session.clone())) {
-						break;
-					}
 					if !inner.config.initial_heartbeat_timeout.is_zero() {
 						session.expect_heartbeat(inner.config.initial_heartbeat_timeout);
 					}
+					// Held until the session is published, so a re-authentication requested meanwhile runs after it.
+					let mut aut = None;
+					if inner.config.authenticate.is_some() {
+						aut = Some(tokio::select! {
+							guard = inner.aut.lock() => guard,
+							_ = stop.changed() => break,
+						});
+						let authenticated = tokio::select! {
+							result = Self::authenticate(&inner, &session) => result,
+							_ = stop.changed() => Err(AuthFailure::Closed(None)),
+						};
+						match authenticated {
+							Ok(_ack) => {}
+							Err(failure) => {
+								// The client closes itself: an endpoint without auth (NAK 400) keeps the session open.
+								let error = match failure {
+									AuthFailure::Nak(error) | AuthFailure::Failed(error) => {
+										session.close_with(CLIENT_POLICY_VIOLATION, FAILED_REASON);
+										Some(error)
+									}
+									AuthFailure::ProviderTimeout(error) | AuthFailure::Timeout(error) => {
+										session.close_with(CLIENT_POLICY_VIOLATION, TIMEOUT_REASON);
+										Some(error)
+									}
+									AuthFailure::Closed(error) => {
+										session.close();
+										error
+									}
+								};
+								drop(aut.take());
+								if let Some(error) = error {
+									warn!(url = %inner.log_url, status = error.status(), "authentication failed");
+									inner.report_auth_error(error).await;
+								}
+								// A failed authentication is a failed attempt: back off before the next.
+								if *stop.borrow() != Stop::No {
+									break;
+								}
+								let delay = inner.config.backoff.delay(attempt);
+								attempt = attempt.saturating_add(1);
+								debug!(url = %inner.log_url, ?delay, "scheduling reconnect");
+								tokio::select! {
+									_ = tokio::time::sleep(delay) => {}
+									_ = stop.changed() => break,
+								}
+								continue;
+							}
+						}
+					}
+					attempt = 0;
+					if !inner.set_session(generation, Some(session.clone())) {
+						break;
+					}
+					drop(aut);
 					if let Some(hook) = inner.connected_hook() {
 						if let Ok(_permit) = inner.config.transport.budget.reserve(Resource::Handler, 0) {
 							tokio::select! {
@@ -515,6 +718,87 @@ impl VcmpClient {
 		debug!(url = %inner.log_url, "client task ended");
 	}
 
+	/// Authenticates a session once: asks the provider for a credential and sends it as `AUT`, both
+	/// within the answer timeout. Resolves with the `ACK` payload.
+	async fn authenticate(inner: &Arc<ClientInner>, session: &Session) -> Result<Value, AuthFailure> {
+		let timed_out = || VcmpError::acknowledgement_timeout();
+		let provider = inner.config.authenticate.as_ref().ok_or(AuthFailure::Closed(None))?;
+		// The answer timeout starts when the provider is asked.
+		let deadline = Instant::now() + inner.config.auth_timeout;
+		// The provider is called inside the future, so a synchronous panic counts like an asynchronous failure.
+		let credential = AssertUnwindSafe(async { provider().await }).catch_unwind();
+		let credential = match tokio::time::timeout_at(deadline, credential).await {
+			Err(_) => return Err(AuthFailure::ProviderTimeout(timed_out())),
+			Ok(Err(_panic)) => {
+				warn!(url = %inner.log_url, "the credential provider panicked");
+				return Err(AuthFailure::Failed(provider_failed("The credential provider failed.")));
+			}
+			Ok(Ok(Err(error))) => {
+				// Kept as the source, never logged with its details: it may quote the credential.
+				return Err(AuthFailure::Failed(provider_failed("The credential provider failed.").with_source(error)));
+			}
+			Ok(Ok(Ok(credential @ Value::Object(_)))) => credential,
+			Ok(Ok(Ok(_))) => {
+				return Err(AuthFailure::Failed(provider_failed("The credential is not a JSON object.")));
+			}
+		};
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		if remaining.is_zero() {
+			return Err(AuthFailure::ProviderTimeout(timed_out()));
+		}
+		let ack = match session.send_authentication(&credential, remaining).await {
+			Ok(ack) => ack,
+			Err(error) if error.is_transport() && error.status() == 504 => return Err(AuthFailure::Timeout(error)),
+			Err(error) if error.is_transport() => return Err(AuthFailure::Closed(Some(error))),
+			Err(error) => return Err(AuthFailure::Nak(error)),
+		};
+		debug!(url = %inner.log_url, "authenticated");
+		Ok(ack)
+	}
+
+	/// One re-authentication, after the `AUT` in flight (if any) was answered.
+	async fn reauthenticate_once(inner: Arc<ClientInner>) -> Result<Option<Value>, VcmpError> {
+		let outcome = {
+			let _aut = inner.aut.lock().await;
+			// From now on, calls join the next re-authentication.
+			inner.reauthentication.lock().unwrap_or_else(|e| e.into_inner()).take();
+			let session = inner.state.lock().unwrap_or_else(|e| e.into_inner()).session.clone();
+			match session.filter(Session::is_open) {
+				// Not authenticated (connecting, disconnected): the next connect asks the provider anyway.
+				None => return Ok(None),
+				// A closed session ends the re-authentication at once (503), so it does not keep the AUT lock
+				// from the next connection's first AUT while its provider is still working.
+				Some(session) => match tokio::select! {
+					result = Self::authenticate(&inner, &session) => result,
+					_ = session.closed() => Err(AuthFailure::Closed(Some(VcmpError::session_closed(
+						"The session closed while the authentication was pending.",
+					)))),
+				} {
+					Ok(ack) => return Ok(Some(ack)),
+					// Nothing was sent: the current authentication is still valid. A NAK: the session stays
+					// (until its old expiry), no automatic retry. The session closed under it: 503.
+					Err(
+						AuthFailure::Failed(error)
+						| AuthFailure::ProviderTimeout(error)
+						| AuthFailure::Nak(error)
+						| AuthFailure::Closed(Some(error)),
+					) => error,
+					Err(AuthFailure::Closed(None)) => VcmpError::session_closed("The session closed."),
+					Err(AuthFailure::Timeout(error)) => {
+						// A second AUT while this one may still be pending would make the server close the session
+						// anyway: reconnect with a fresh credential.
+						session.close_with(CLIENT_POLICY_VIOLATION, TIMEOUT_REASON);
+						error
+					}
+				},
+			}
+		};
+		// Reported after the AUT lock is released, so a hook may itself call `reauthenticate` (and await it).
+		warn!(url = %inner.log_url, status = outcome.status(), "re-authentication failed");
+		inner.report_auth_error(outcome.clone()).await;
+		Err(outcome)
+	}
+
 	async fn connect(inner: &Arc<ClientInner>) -> Result<Session, ConnectError> {
 		let config = &inner.config;
 		let connection =
@@ -551,6 +835,15 @@ impl ClientInner {
 		self.on_disconnected.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
+	async fn report_auth_error(&self, error: VcmpError) {
+		let hook = self.on_auth_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		if let Some(hook) = hook {
+			if let Ok(_permit) = self.config.transport.budget.reserve(Resource::Handler, 0) {
+				let _ = tokio::time::timeout(self.config.transport.limits.handler_timeout, hook(error)).await;
+			}
+		}
+	}
+
 	/// Sets the current session, unless a later `start()` has replaced this generation.
 	fn set_session(&self, generation: u64, session: Option<Session>) -> bool {
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -580,6 +873,7 @@ impl fmt::Debug for ClientBuilder {
 		f.debug_struct("ClientBuilder")
 			.field("url", &"[redacted]")
 			.field("headers", &"[redacted]")
+			.field("authenticate", &self.authenticate.is_some())
 			.field("transport", &self.transport)
 			.finish_non_exhaustive()
 	}

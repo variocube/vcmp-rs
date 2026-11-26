@@ -71,9 +71,11 @@ where
 		let Path(params) = Path::<HashMap<String, String>>::from_request_parts(parts, state)
 			.await
 			.map_err(IntoResponse::into_response)?;
-		let path = parts.extensions.get::<OriginalUri>().map_or(&parts.uri, |original| &original.0).path().to_owned();
+		let uri = parts.extensions.get::<OriginalUri>().map_or(&parts.uri, |original| &original.0);
+		let (path, query) = (uri.path().to_owned(), uri.query().map(str::to_owned));
 		let connect_info = ConnectInfo {
 			path,
+			query,
 			params,
 			headers: Headers(&parts.headers).to_vec(),
 			remote_addr: parts.extensions.get::<PeerAddr<SocketAddr>>().map(|addr| addr.0),

@@ -29,6 +29,7 @@ Text WebSocket frames. Each frame starts with a 3-letter type:
 | `ACK` | `ACK` + id + optional JSON payload | The peer's handler completed; payload is its result. |
 | `NAK` | `NAK` + id + optional JSON payload | The peer's handler failed; payload is an RFC 7807-style problem detail (`title`, `status`, `detail`, …). |
 | `HBT` | `HBT` + interval in ms (decimal) | Heartbeat. One side initiates; the receiver echoes after the interval; each side closes the session if no heartbeat arrives within 2 × interval. |
+| `AUT` | `AUT` + 12-char id + JSON object | Client → server: authenticate the session with a credential whose shape the endpoint defines. Answered with `ACK` (optional `expiresIn` in ms) or `NAK` (`400` malformed or no auth, `401` invalid, `403` not allowed, `500` authenticator failed, `503` overloaded). Never dispatched to handlers, never logged. See [Session authentication](#session-authentication-aut). |
 
 Message ids are 9 random bytes, base64url-encoded (12 chars). Requests default to a 30-second
 acknowledgement deadline. A caller can impose a shorter `tokio::time::timeout`; dropping the send
@@ -41,7 +42,7 @@ Add it as a git dependency (not published to crates.io):
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.4" }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.5.0" }
 ```
 
 Feature flags: `client` (default), `server`, `axum` (includes `server`), `tls` (`wss://` via
@@ -128,6 +129,105 @@ let results = drivers.broadcast(&msg).await;                          // per-ses
 handle.stop().await;                                                 // closes every session
 ```
 
+### Session authentication (`AUT`)
+
+Browsers cannot set headers on a WebSocket handshake, so a credential would otherwise end up in the
+URL. With `AUT` the client sends it as the session's first frame instead (spec:
+[vcmp-spring#34](https://github.com/variocube/vcmp-spring/issues/34), wire-compatible with
+vcmp-spring and vcmp-js). Endpoints and clients without the options below behave as before; an `AUT`
+to an endpoint without the opt-in is answered with `NAK` 400.
+
+```rust
+use vcmp::{Authentication, Authenticator, Session, VcmpError};
+
+let keycard = server.endpoint("/keycard");
+keycard.authenticate(Authenticator::new(|_session: Session, credential: serde_json::Value| async move {
+    let token = credential["token"].as_str().ok_or_else(|| VcmpError::new(401, "Unauthorized"))?;
+    let account = accounts.by_token(token).await.ok_or_else(|| VcmpError::new(401, "Unauthorized"))?;
+    Ok(Authentication::new(account.id)                // the principal; compared by PartialEq on re-authentication
+        .expires_in(Duration::from_secs(300))         // optional: closes the session unless re-authenticated
+        .ack_member("account", account.name))         // optional: further ACK payload members
+}));
+keycard.on_connected(|session| async move {            // only once authenticated
+    let account = session.principal::<AccountId>();
+});
+
+let client = VcmpClient::builder("wss://example.com/keycard")
+    // Called on every (re)connect and re-authentication.
+    .authenticate(|| async { Ok(serde_json::json!({"token": current_token().await?})) })
+    .build();
+client.on_auth_error(|error| async move { tracing::warn!(status = error.status(), "authentication failed") });
+// The application re-authenticates when its token was renewed; the client schedules nothing.
+token_library.on_token_refreshed(move || {
+    let client = client.clone();
+    async move { let _ = client.reauthenticate().await; }
+});
+```
+
+Server (`Endpoint::authenticate`, close code always 1008):
+
+- Until a session is authenticated it accepts only `HBT` and `AUT`; a `MSG`, `ACK` or `NAK`, an
+  unparseable frame or a binary message (`authentication required`), no `ACK` within
+  `Authenticator::timeout` (default 10 s from connect, also covering a hanging authenticator;
+  `authentication timeout`), a second `AUT` while one is pending
+  (`concurrent authentication`) or a `NAK` to the first `AUT` (`authentication failed`, after the `NAK`)
+  closes it. A credential that is not a JSON object is answered with `NAK` 400; an authenticator that
+  panics or exceeds the handler deadline, or a panicking principal comparison, with `NAK` 500, and an
+  `AUT` the server has no handler capacity for with `NAK` 503 (overloaded, retryable), failing closed the
+  same way. A result is checked in this order: principal (always present in Rust) → expiry in
+  the future (else `NAK` 401, also when the remaining `expiresIn` would round to 0) → on a
+  re-authentication, the same principal. The session counts as authenticated only once its `ACK` is queued.
+- Authenticator panics (also before an authenticator returns its future) are answered with `NAK` 500 only
+  if the *binary* unwinds: Cargo uses the consuming binary's profile, and unit and controller-rs build with
+  `panic = "abort"`, where an authenticator panic ends the process. Authenticators should return a
+  `VcmpError`, never panic.
+- The connect hook runs, and `sessions()`, `session_count()` and `broadcast` include a session, only
+  once it is authenticated; sends to an unauthenticated session fail. The disconnect hook runs only for
+  sessions that connected in that sense. The principal is `Session::principal::<P>()`.
+- With an expiry the session closes at that instant (`authentication expired`). An `AUT` on an
+  authenticated session re-authenticates while messages keep flowing: the same principal replaces the
+  expiry (or removes it); another principal gets `NAK` 403 and closes the session (`principal
+  changed`); any other rejection (`401`, `403` without a principal change, `500`) gets that `NAK` and
+  the session stays open until its current expiry.
+- Transition: `Authenticator::with_handshake` also accepts a credential in the handshake
+  (`ConnectInfo::query`, path parameters, headers) from old clients. It runs before any frame is read:
+  valid → authenticated at connect; invalid → closed (1008, no fallback to `AUT`); none → `AUT`
+  required. `Endpoint::authentication_counts()` (and the `session connected` log line) tell handshake
+  from `AUT` authentications, so the handshake authenticator can be removed once the last old client
+  is gone.
+
+Client (`ClientBuilder::authenticate`): the provider is called on every connection once the WebSocket is
+open, and the client sends `AUT` first and counts as connected (`on_connected`, `wait_connected`,
+sends) only after the `ACK`. The answer timeout (`auth_timeout`, default 10 s) starts when the provider
+is asked. Authentication errors go to `on_auth_error`, with these statuses: the server's `NAK` (its
+status), `500` for a failed provider (an error, a panic, or a credential that is not a JSON object), `504`
+for a provider that doesn't complete or an `AUT` without an answer in time (an older server that does
+not know `AUT`), `503` when the session closed while the `AUT` was pending (an older server that closes
+on it). On connect the client then closes the session itself with **4008** (browsers cannot close with
+1008, so every VCMP client uses 4008; servers use 1008) and reconnects with backoff. Close
+reasons: `authentication failed` (a `NAK` to the first `AUT`, a failing provider on connect) and
+`authentication timeout` (no answer to a sent `AUT`, a provider that doesn't complete on connect).
+Answer timeouts below 1 s are rejected (the builder panics). A malformed `ACK` (a payload that is not an
+object, an `expiresIn` that is not a non-negative integer) counts as one without expiry, with a warning.
+The `ACK` payload is `Session::authentication()`.
+
+The application triggers re-authentication; the client sets no timer. `VcmpClient::reauthenticate()`
+asks the provider and sends one `AUT` on the open session, typically from the token library's "token
+refreshed" callback, and resolves with the `ACK` payload (including `expiresIn`). Its errors also go to
+`on_auth_error` (same statuses): a `NAK` keeps the session until its current expiry and is not retried;
+a failing or hanging provider sends nothing and keeps the session; an `AUT` without an answer closes
+the session (4008 `authentication timeout`) and reconnects. The hooks may call `reauthenticate()`
+themselves, but an `on_auth_error` hook that re-authenticates on every error loops for as long as the
+server keeps refusing: back off, or re-authenticate only when the application has a fresh token. A
+re-authentication whose session closes ends at once (`503`), so it never delays the next connection.
+One `AUT` is in flight at a time: calls made while one is pending are served together by a single
+further `AUT` after its answer. Without an authenticated session the call sends nothing and resolves
+with `Ok(None)`. An application that never
+re-authenticates loses the session at expiry (the server closes it) and the client reconnects with a
+fresh credential.
+
+`wss://` is still required for anything secret: `AUT` only moves the credential out of the URL.
+
 ### Sharing an axum listener
 
 Enable `axum` to mount VCMP endpoints in an axum 0.8 router alongside REST handlers, static
@@ -136,7 +236,7 @@ listener and HTTP shutdown:
 
 ```toml
 [dependencies]
-vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.4.4", default-features = false, features = ["axum"] }
+vcmp = { git = "https://github.com/variocube/vcmp-rs", tag = "0.5.0", default-features = false, features = ["axum"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 ```
@@ -365,12 +465,13 @@ interrupt blocking code or undo a mutation already dispatched to another service
 untracked work from these callbacks. Routine transport logs exclude payloads and credentials;
 client log lines carry the connection URL with userinfo, query and fragment removed
 (`scheme://host[:port]/path`). The path is logged, so credentials belong in headers, userinfo or
-the query, never in the path. `Debug` output redacts connection headers, paths/parameters and
-client URLs.
+the query, never in the path. `Debug` output redacts connection headers, query strings,
+paths/parameters and client URLs.
 
 Executable coverage is in `tests/bounds.rs` (counts/bytes, non-ACKing peers, drop/deadline cleanup,
 control priority, stalled writes, oversized frames and old-handler cancellation),
-`tests/payload_retention.rs` (allocation release before acknowledgement), `tests/client.rs`
+`tests/payload_retention.rs` (allocation release before acknowledgement), `tests/auth_session.rs`,
+`tests/auth_socket.rs` and `tests/auth_logging.rs` (session authentication), `tests/client.rs`
 (fresh credentials, cancellation and replacement), and `tests/server.rs` (bare/axum admission,
 slow handshakes, detached listeners and shutdown). The existing codec/property/socket and JS/Java
 contract suites continue to check the deployed wire format. Application authorization and durable
@@ -405,8 +506,17 @@ and CI enable the `axum` feature to exercise both.
 Each direction covers: send + ACK (with and without result); NAK with a problem detail
 (status/title/detail preserved); unknown `@type` → empty NAK; 100 KB and 1 MB messages; 100
 concurrent pending sends settled in any order; heartbeat exchange for ≥ 3 intervals; and a server
-restart → reconnect → send-after-reconnect. They are `#[ignore]`d by default (they spawn `node` /
-`java`); run them with:
+restart → reconnect → send-after-reconnect.
+
+Session authentication (`AUT`) has its own scenarios (`tests/contract/auth.rs`), the eleven cases of
+[vcmp-spring#34](https://github.com/variocube/vcmp-spring/issues/34) in both directions: raw sockets and the
+Rust client against the peer's `/auth/{name}` (and `/peer/{name}` without the opt-in), and the peer's client
+(with `authenticate`, or as an old client without it) against the Rust server. All peers share one credential
+scheme: `{"token": "<principal>[:<n>]", "ttl": <ms>?}`, `bad` is rejected with 401, the `ACK` carries `user`,
+the handshake credential is the query parameter `token`, and peer servers time out authentication after
+1.5 s. Close reasons are not compared.
+
+They are `#[ignore]`d by default (they spawn `node` / `java`); run them with:
 
 ```bash
 contract/run.sh            # both peers (needs node, a JDK, and ../vcmp-spring)

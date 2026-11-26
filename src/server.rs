@@ -16,9 +16,13 @@
 //! ```
 //!
 //! The server initiates the heartbeat on every session (20 s by default).
+//!
+//! An endpoint can require session authentication with the `AUT` frame:
+//! [`Endpoint::authenticate`] with an [`Authenticator`]; see [`crate::session::auth`].
 
 use crate::error::VcmpError;
 use crate::resources::{Permit, Resource};
+use crate::session::auth::{AuthenticationCounts, AuthenticationMethod, Authenticator};
 use crate::session::{ConnectInfo, HandlerMap, Session, SessionOptions, VcmpMessage};
 use crate::ws::{Headers, TransportOptions, spawn_session};
 use crate::{ResourceBudget, SessionLimits};
@@ -30,7 +34,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -130,6 +134,9 @@ impl VcmpServer {
 				pending_upgrades: tokio::sync::watch::channel(0).0,
 				on_connected: Mutex::new(None),
 				on_disconnected: Mutex::new(None),
+				authenticator: Mutex::new(None),
+				handshake_authentications: AtomicU64::new(0),
+				aut_authentications: AtomicU64::new(0),
 			}),
 		};
 		self.inner.endpoints.write().unwrap_or_else(|e| e.into_inner()).push(endpoint.clone());
@@ -155,7 +162,8 @@ impl VcmpServer {
 			// Hyper can finish the HTTP connection before the upgrade task registers its session.
 			let _ = pending.wait_for(|count| *count == 0).await;
 		}
-		let sessions: Vec<_> = endpoints.iter().flat_map(Endpoint::sessions).collect();
+		// Including sessions that are not authenticated yet.
+		let sessions: Vec<_> = endpoints.iter().flat_map(Endpoint::all_sessions).collect();
 		for session in &sessions {
 			session.close();
 		}
@@ -238,6 +246,7 @@ impl VcmpServer {
 						endpoint.clone(),
 						ConnectInfo {
 							path: path.to_owned(),
+							query: request.uri().query().map(str::to_owned),
 							params,
 							headers: Headers(request.headers()).to_vec(),
 							remote_addr: Some(remote_addr),
@@ -361,6 +370,9 @@ struct EndpointInner {
 	pending_upgrades: tokio::sync::watch::Sender<usize>,
 	on_connected: Mutex<Option<SessionHook>>,
 	on_disconnected: Mutex<Option<SessionHook>>,
+	authenticator: Mutex<Option<Authenticator>>,
+	handshake_authentications: AtomicU64,
+	aut_authentications: AtomicU64,
 }
 
 impl EndpointInner {
@@ -410,14 +422,13 @@ impl Endpoint {
 	where
 		S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 	{
-		let remote_addr = connect_info.remote_addr;
 		let options = SessionOptions {
 			handlers: self.inner.handlers.clone(),
 			connect_info: Some(connect_info),
+			authenticator: self.inner.authenticator.lock().unwrap_or_else(|e| e.into_inner()).clone(),
 			..Default::default()
 		};
 		let session = spawn_session(options, &self.inner.config.transport, ws, connection);
-		info!(session = session.id(), ?remote_addr, path = self.path(), "session connected");
 		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session.id(), session.clone());
 		session.initiate_heartbeat(self.inner.config.heartbeat_interval);
 		session
@@ -425,6 +436,23 @@ impl Endpoint {
 
 	pub(crate) async fn serve_session(&self, session: Session) {
 		let _cleanup = SessionCleanup { endpoint: self.clone(), session: session.clone() };
+		let remote_addr = session.connect_info().and_then(|info| info.remote_addr);
+		// On an endpoint with authentication, a session counts as connected only once authenticated.
+		if !session.authenticated().await {
+			debug!(session = session.id(), ?remote_addr, path = self.path(), "session closed before authentication");
+			session.closed().await;
+			return;
+		}
+		let method = session.authentication_method();
+		let counter = match method {
+			Some(AuthenticationMethod::Handshake) => Some(&self.inner.handshake_authentications),
+			Some(AuthenticationMethod::Aut) => Some(&self.inner.aut_authentications),
+			None => None,
+		};
+		if let Some(counter) = counter {
+			counter.fetch_add(1, Ordering::Relaxed);
+		}
+		info!(session = session.id(), ?remote_addr, path = self.path(), authenticated = ?method, "session connected");
 		if let Some(hook) = self.inner.hook(&self.inner.on_connected) {
 			if let Ok(_permit) = self.inner.config.transport.budget.reserve(Resource::Handler, 0) {
 				tokio::select! {
@@ -437,7 +465,6 @@ impl Endpoint {
 		}
 		session.closed().await;
 		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id());
-		let remote_addr = session.connect_info().and_then(|info| info.remote_addr);
 		info!(session = session.id(), ?remote_addr, path = self.path(), "session disconnected");
 		if let Some(hook) = self.inner.hook(&self.inner.on_disconnected) {
 			if let Ok(_permit) = self.inner.config.transport.budget.reserve(Resource::Handler, 0) {
@@ -486,7 +513,26 @@ impl Endpoint {
 		&self.inner.handlers
 	}
 
-	/// Sets the hook that runs when a session connected (after the heartbeat was initiated).
+	/// Requires every new session of this endpoint to authenticate (`AUT` frame, optionally a
+	/// handshake credential); see [`crate::session::auth`]. Sessions already connected are not
+	/// affected. Without it, an `AUT` is answered with `NAK` 400.
+	pub fn authenticate(&self, authenticator: Authenticator) -> &Self {
+		*self.inner.authenticator.lock().unwrap_or_else(|e| e.into_inner()) = Some(authenticator);
+		self
+	}
+
+	/// How many sessions were authenticated by handshake and by `AUT` so far. Also logged per
+	/// session (`session connected`, field `authenticated`).
+	pub fn authentication_counts(&self) -> AuthenticationCounts {
+		AuthenticationCounts {
+			handshake: self.inner.handshake_authentications.load(Ordering::Relaxed),
+			aut: self.inner.aut_authentications.load(Ordering::Relaxed),
+		}
+	}
+
+	/// Sets the hook that runs when a session connected (after the heartbeat was initiated). On an
+	/// endpoint with [authentication](Endpoint::authenticate), only once the session is authenticated;
+	/// the disconnect hook runs only for sessions that connected in that sense.
 	pub fn on_connected<F, Fut>(&self, hook: F) -> &Self
 	where
 		F: Fn(Session) -> Fut + Send + Sync + 'static,
@@ -508,14 +554,21 @@ impl Endpoint {
 		self
 	}
 
-	/// The currently connected sessions.
+	/// The currently connected sessions; on an endpoint with authentication, the authenticated ones.
 	pub fn sessions(&self) -> Vec<Session> {
-		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+		let sessions = self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner());
+		sessions.values().filter(|session| session.is_authenticated()).cloned().collect()
 	}
 
-	/// The number of connected sessions.
+	/// The number of connected (authenticated) sessions.
 	pub fn session_count(&self) -> usize {
-		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).len()
+		let sessions = self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner());
+		sessions.values().filter(|session| session.is_authenticated()).count()
+	}
+
+	/// Every open session, also those not authenticated yet.
+	fn all_sessions(&self) -> Vec<Session> {
+		self.inner.sessions.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
 	}
 
 	/// Sends a message to every connected session and waits for all acknowledgements.

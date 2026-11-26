@@ -5,11 +5,12 @@
 //! [`vcmp-js`](https://github.com/variocube/vcmp-js) and
 //! [`vcmp-spring`](https://github.com/variocube/vcmp-spring).
 //!
-//! - [`frame`]: the codec (`MSG` / `ACK` / `NAK` / `HBT`).
+//! - [`frame`]: the codec (`MSG` / `ACK` / `NAK` / `HBT` / `AUT`).
 //! - [`error`]: [`ProblemDetail`] and [`VcmpError`].
 //! - [`session`]: the protocol state machine over an abstract text-frame duplex.
 //! - [`client`] (feature `client`): a reconnecting WebSocket client.
 //! - [`server`] (feature `server`): a WebSocket server with path-pattern endpoints.
+//! - [`session::auth`] (feature `server`): session authentication with the `AUT` frame.
 //! - [`axum`] (feature `axum`): VCMP endpoints alongside HTTP routes in an axum router.
 //!
 //! ```ignore
@@ -53,7 +54,12 @@ mod ws;
 pub use error::{ProblemDetail, ResultExt, VcmpError};
 pub use frame::Frame;
 pub use resources::{ResourceBudget, ResourceLimits, ResourceSnapshot};
-pub use session::{Arrival, ConnectInfo, HandlerMap, Session, SessionLimits, SessionOptions, VcmpMessage};
+#[cfg(feature = "server")]
+pub use session::auth::{Authentication, AuthenticationCounts, AuthenticationMethod, Authenticator};
+pub use session::{
+	Arrival, CLIENT_POLICY_VIOLATION, CloseReason, ConnectInfo, HandlerMap, POLICY_VIOLATION, Session, SessionLimits,
+	SessionOptions, VcmpMessage,
+};
 
 #[cfg(feature = "client")]
 pub use client::{Backoff, ClientBuilder, VcmpClient};
