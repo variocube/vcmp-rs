@@ -18,13 +18,15 @@ import org.springframework.context.event.EventListener;
  *   ContractPeer client-auth &lt;url&gt; &lt;credentials-json&gt; [--hello]   connect and authenticate with AUT
  * </pre>
  *
- * The server runs {@code /peer/{name}} (no authentication) and {@code /auth/{name}} ({@link AuthServerPeer}).
+ * The server listens on {@code port}, {@code 0} picks a free one; either way it prints it as LISTENING &lt;port&gt;.
+ * It runs {@code /peer/{name}} (no authentication) and {@code /auth/{name}} ({@link AuthServerPeer}).
  * {@code credentials-json} is a JSON array of credentials the provider returns in turn (the last one repeated).
  * {@code --hello} sends a {@code contract:Echo} once connected.
  * <p>
- * Prints one lifecycle event per line to stdout: READY, CONNECTED, DISCONNECTED, AUTH_CONNECTED &lt;principal&gt;,
- * AUTH_DISCONNECTED, AUTH_ERROR &lt;status&gt;, HELLO_OK, HELLO_FAILED, and for the stdin command {@code REAUTH} (the
- * client roles' application calls {@code reauthenticate()}): REAUTH_OK, REAUTH_NONE, REAUTH_ERROR &lt;status&gt;.
+ * Prints one lifecycle event per line to stdout: LISTENING &lt;port&gt; (server, before READY), READY, CONNECTED,
+ * DISCONNECTED, AUTH_CONNECTED &lt;principal&gt;, AUTH_DISCONNECTED, AUTH_ERROR &lt;status&gt;, HELLO_OK,
+ * HELLO_FAILED, and for the stdin command {@code REAUTH} (the client roles' application calls
+ * {@code reauthenticate()}): REAUTH_OK, REAUTH_NONE, REAUTH_ERROR &lt;status&gt;.
  */
 @Slf4j
 @SpringBootApplication
@@ -115,7 +117,10 @@ public class ContractPeer {
 	}
 
 	@EventListener(ApplicationReadyEvent.class)
-	public void onReady() {
+	public void onReady(ApplicationReadyEvent event) {
+		// The bound port, also when started with port 0.
+		var port = event.getApplicationContext().getEnvironment().getProperty("local.server.port");
+		System.out.println("LISTENING " + port);
 		System.out.println("READY");
 	}
 }

@@ -8,6 +8,8 @@
  *   node peer.js client <url> [--hello]                          an old client, no AUT
  *   node peer.js client-auth <url> <credentials-json> [--hello]  authenticates with AUT
  *
+ * The server roles listen on `port`, `0` picks a free one; either way they print it as `LISTENING <port>`.
+ *
  * Contract credential scheme (vcmp-rs#16, shared with the Java peer and tests/contract/mod.rs): the AUT credential is
  * `{token: "<principal>[:<n>]", ttl?: <ms>}`; the principal is the token up to `:`; `bad` (or none) is rejected with
  * 401; `ttl` sets the expiry (≤ 0: already over); the ACK carries `user`. The handshake credential (transition
@@ -23,9 +25,10 @@
  *   contract:Run    {scenario, ...}           → performs a send *to the sender* and ACKs with the
  *                                               outcome: {ok: true, result} or {ok: false, error}
  *
- * Lifecycle events are printed to stdout, one per line: READY, CONNECTED, DISCONNECTED, AUTH_CONNECTED <principal>,
- * AUTH_DISCONNECTED, AUTH_ERROR <status>, HELLO_OK, HELLO_FAILED, and for the stdin command `REAUTH` (the client
- * roles' application calls `client.reauthenticate()`): REAUTH_OK, REAUTH_NONE or REAUTH_ERROR <status>.
+ * Lifecycle events are printed to stdout, one per line: LISTENING <port> (server roles, before READY), READY,
+ * CONNECTED, DISCONNECTED, AUTH_CONNECTED <principal>, AUTH_DISCONNECTED, AUTH_ERROR <status>, HELLO_OK, HELLO_FAILED,
+ * and for the stdin command `REAUTH` (the client roles' application calls `client.reauthenticate()`): REAUTH_OK,
+ * REAUTH_NONE or REAUTH_ERROR <status>.
  */
 const {VcmpClient, VcmpError} = require("@variocube/vcmp");
 const {VcmpServer} = require("@variocube/vcmp-server");
@@ -119,7 +122,12 @@ function server(port, heartbeatInterval) {
 	register((type, handler) => server.on(type, handler));
 	server.onSessionConnected = () => console.log("CONNECTED");
 	server.onSessionDisconnected = () => console.log("DISCONNECTED");
-	webSocketServer.on("listening", () => console.log("READY"));
+	webSocketServer.on("listening", () => listening(webSocketServer));
+}
+
+function listening(webSocketServer) {
+	console.log("LISTENING " + webSocketServer.address().port);
+	console.log("READY");
 }
 
 function decide(token, ttl) {
@@ -152,7 +160,7 @@ function serverAuth(port, heartbeatInterval) {
 	register((type, handler) => server.on(type, handler));
 	server.onSessionConnected = session => console.log("AUTH_CONNECTED " + session.principal);
 	server.onSessionDisconnected = () => console.log("AUTH_DISCONNECTED");
-	webSocketServer.on("listening", () => console.log("READY"));
+	webSocketServer.on("listening", () => listening(webSocketServer));
 }
 
 function client(url, {credentials, hello} = {}) {

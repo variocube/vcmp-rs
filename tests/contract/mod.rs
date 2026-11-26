@@ -97,8 +97,8 @@ pub fn init_tracing() {
 	let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_test_writer().try_init();
 }
 
-/// A peer process with its stdout events (READY / CONNECTED / DISCONNECTED) and a stdin for commands
-/// (`REAUTH`, client roles).
+/// A peer process with its stdout events (LISTENING <port> / READY / CONNECTED / DISCONNECTED) and a stdin for
+/// commands (`REAUTH`, client roles).
 pub struct PeerProcess {
 	child: Child,
 	stdin: Option<tokio::process::ChildStdin>,
@@ -145,6 +145,15 @@ impl PeerProcess {
 		.unwrap_or_else(|_| panic!("peer did not report {event} x{count}"));
 	}
 
+	/// The port a server peer listens on, from its `LISTENING <port>` line. A server peer prints it before `READY`, so
+	/// call this once `READY` was seen. Peer servers are started on port `0` (the peer binds a free port) rather than
+	/// on a port picked here: one freed for the peer could be taken by another test before the peer binds it.
+	pub fn listening_port(&self) -> u16 {
+		let events = self.events.lock().unwrap();
+		let port = events.iter().find_map(|event| event.trim().strip_prefix("LISTENING ")?.parse().ok());
+		port.expect("the peer did not report LISTENING <port>")
+	}
+
 	pub async fn kill(&mut self) {
 		let _ = self.child.kill().await;
 	}
@@ -158,10 +167,6 @@ pub async fn wait_until(condition: impl Fn() -> bool) {
 	})
 	.await
 	.expect("condition not met in time");
-}
-
-pub fn free_port() -> u16 {
-	std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
 pub fn rust_client(url: &str) -> VcmpClient {

@@ -485,8 +485,8 @@ pub type SpawnClient<'a> =
 
 /// Cases 1–4 and 6–11 with a peer client against the Rust server.
 pub async fn peer_client_against_rust_server(host: ServerHost, spawn: SpawnClient<'_>) {
-	let port = free_port();
-	let server = rust_auth_server(host, port).await;
+	let server = rust_auth_server(host, 0).await;
+	let port = server.handle.local_addr().port();
 	let auth = format!("ws://127.0.0.1:{port}/auth/peer");
 	let open = format!("ws://127.0.0.1:{port}/peer/peer");
 	let principals = |server: &RustAuthServer| server.connected.lock().unwrap().clone();
@@ -585,8 +585,8 @@ pub async fn peer_client_against_rust_server(host: ServerHost, spawn: SpawnClien
 	peer.kill().await;
 
 	// Without an authenticated session (here: nothing to connect to), `reauthenticate()` has no outcome.
-	let unreachable = format!("ws://127.0.0.1:{}/auth/peer", free_port());
-	let mut peer = spawn(unreachable, Some(json!([{"token": "alice"}])), false).await;
+	// Port 1: nothing listens there and it is refused on every OS (a freed port could be taken by a parallel test).
+	let mut peer = spawn("ws://127.0.0.1:1/auth/peer".into(), Some(json!([{"token": "alice"}])), false).await;
 	peer.command("REAUTH").await;
 	peer.wait_for("REAUTH_NONE", 1).await;
 	peer.kill().await;
