@@ -7,6 +7,8 @@
 
 #[path = "../server_host/mod.rs"]
 pub mod server_host;
+
+pub mod auth;
 pub use server_host::{HostHandle, ServerHost};
 
 use serde::{Deserialize, Serialize};
@@ -95,16 +97,19 @@ pub fn init_tracing() {
 	let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_test_writer().try_init();
 }
 
-/// A peer process with its stdout events (READY / CONNECTED / DISCONNECTED).
+/// A peer process with its stdout events (READY / CONNECTED / DISCONNECTED) and a stdin for commands
+/// (`REAUTH`, client roles).
 pub struct PeerProcess {
 	child: Child,
+	stdin: Option<tokio::process::ChildStdin>,
 	events: Arc<Mutex<Vec<String>>>,
 }
 
 impl PeerProcess {
 	pub async fn spawn(mut command: Command) -> Self {
-		command.stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true);
+		command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true);
 		let mut child = command.spawn().expect("could not spawn the peer process");
+		let stdin = child.stdin.take();
 		let stdout = child.stdout.take().unwrap();
 		let events = Arc::new(Mutex::new(Vec::new()));
 		let sink = events.clone();
@@ -115,7 +120,15 @@ impl PeerProcess {
 				sink.lock().unwrap().push(line);
 			}
 		});
-		PeerProcess { child, events }
+		PeerProcess { child, stdin, events }
+	}
+
+	/// Sends a command line to the peer (e.g. `REAUTH`: its application calls `reauthenticate()`).
+	pub async fn command(&mut self, line: &str) {
+		use tokio::io::AsyncWriteExt;
+		let stdin = self.stdin.as_mut().expect("the peer's stdin");
+		stdin.write_all(format!("{line}\n").as_bytes()).await.expect("could not write to the peer");
+		stdin.flush().await.expect("could not write to the peer");
 	}
 
 	pub fn count(&self, event: &str) -> usize {

@@ -31,6 +31,21 @@ async fn java_server(port: u16, heartbeat_ms: u64) -> PeerProcess {
 	peer
 }
 
+/// A java client: with `credentials` (a JSON array) it authenticates with AUT, else it is an old client.
+async fn java_auth_client(url: String, credentials: Option<serde_json::Value>, hello: bool) -> PeerProcess {
+	let credentials = credentials.map(|credentials| credentials.to_string());
+	let mut args = match &credentials {
+		Some(credentials) => vec!["client-auth", url.as_str(), credentials.as_str()],
+		None => vec!["client", url.as_str()],
+	};
+	if hello {
+		args.push("--hello");
+	}
+	let peer = PeerProcess::spawn(peer(&args)).await;
+	peer.wait_for("READY", 1).await;
+	peer
+}
+
 async fn java_client(url: &str) -> PeerProcess {
 	let peer = PeerProcess::spawn(peer(&["client", url])).await;
 	peer.wait_for("READY", 1).await;
@@ -125,4 +140,40 @@ async fn server_against_spring_client(host: ServerHost) {
 	client.wait_for("DISCONNECTED", 2).await;
 	client.kill().await;
 	server.stop().await;
+}
+
+// Session authentication (AUT), contract cases 1–11 of variocube/vcmp-spring#34, see tests/contract/auth.rs.
+
+#[tokio::test]
+#[ignore = "needs a JDK and the vcmp-spring checkout"]
+async fn aut_against_spring_server() {
+	init_tracing();
+	let port = free_port();
+	// One Spring app serves /peer/{name} (no opt-in) and /auth/{name} (AuthServerPeer).
+	let mut server = java_server(port, 20000).await;
+	let target = auth::AuthTarget {
+		auth: format!("ws://127.0.0.1:{port}/auth/raw"),
+		open: format!("ws://127.0.0.1:{port}/peer/raw"),
+	};
+	auth::raw_against_peer_server(&target).await;
+	auth::rust_client_against_peer_server(&target).await;
+	server.kill().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a JDK and the vcmp-spring checkout"]
+async fn aut_spring_client_against_rust_server() {
+	init_tracing();
+	auth::peer_client_against_rust_server(ServerHost::Bare, &|url, credentials, hello| {
+		Box::pin(java_auth_client(url, credentials, hello))
+	})
+	.await;
+}
+
+#[tokio::test]
+#[ignore = "needs a JDK and the vcmp-spring checkout"]
+async fn aut_spring_client_closes_with_4008() {
+	init_tracing();
+	auth::peer_client_closes_with_4008(&|url, credentials, hello| Box::pin(java_auth_client(url, credentials, hello)))
+		.await;
 }

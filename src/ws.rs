@@ -1,15 +1,18 @@
 //! Adapters between `tokio-tungstenite` and the transport-agnostic [`Session`](crate::Session).
 
 use crate::resources::{Permit, ResourceBudget};
-use crate::session::{Session, SessionLimits, SessionOptions};
+use crate::session::{BINARY_MESSAGE, CloseSlot, Session, SessionLimits, SessionOptions};
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
+use futures_util::{Sink, Stream, StreamExt, future, ready};
+#[cfg(feature = "server")]
 use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Frame as WsFrame};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::debug;
 
@@ -55,7 +58,9 @@ where
 	let (sink, stream) = ws.split();
 	options.limits = transport.limits.clone();
 	options.budget = transport.budget.clone();
-	Session::spawn_admitted(options, incoming(stream), outgoing(sink, transport.fragment_size), connection)
+	let close = CloseSlot::default();
+	let outgoing = Outgoing { sink, fragment_size: transport.fragment_size, buffered: None, close: close.clone() };
+	Session::spawn_admitted(options, incoming(stream), outgoing, connection, close)
 }
 
 /// Maps the WebSocket stream to VCMP's text frames: text messages pass through, binary frames
@@ -83,39 +88,111 @@ where
 			future::ready(match message {
 				Ok(Message::Text(text)) => Some(text.to_string()),
 				Ok(Message::Binary(_)) => {
-					// Unsupported binary frames never enter VCMP queues.
-					None
+					// Unsupported: only a marker enters the session (its payload never does), which drops it, or
+					// closes a session that is not authenticated yet.
+					Some(BINARY_MESSAGE.to_owned())
 				}
 				_ => None,
 			})
 		})
 }
 
-/// Maps VCMP's text frames to WebSocket messages, optionally fragmenting large ones.
-fn outgoing<S>(
+/// Maps VCMP's text frames to WebSocket messages, optionally fragmenting large ones. Closing
+/// sends the session's close code and reason, if it set one.
+struct Outgoing<S> {
 	sink: SplitSink<WebSocketStream<S>, Message>,
 	fragment_size: Option<usize>,
-) -> impl Sink<String, Error = WsError> + Send + Unpin + 'static
+	/// The fragments of the message being sent.
+	buffered: Option<Fragments>,
+	/// Taken when the close frame is sent.
+	close: CloseSlot,
+}
+
+impl<S> Outgoing<S>
 where
-	S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+	S: AsyncRead + AsyncWrite + Unpin,
 {
-	sink.with_flat_map(move |text: String| futures_util::stream::iter(message_fragments(text, fragment_size).map(Ok)))
+	fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+		while let Some(fragments) = &mut self.buffered {
+			if fragments.done {
+				self.buffered = None;
+				break;
+			}
+			ready!(Pin::new(&mut self.sink).poll_ready(cx))?;
+			if let Some(message) = fragments.next() {
+				Pin::new(&mut self.sink).start_send(message)?;
+			}
+		}
+		Poll::Ready(Ok(()))
+	}
+}
+
+impl<S> Sink<String> for Outgoing<S>
+where
+	S: AsyncRead + AsyncWrite + Unpin,
+{
+	type Error = WsError;
+
+	fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+		self.get_mut().poll_drain(cx)
+	}
+
+	fn start_send(self: Pin<&mut Self>, text: String) -> Result<(), WsError> {
+		let this = self.get_mut();
+		this.buffered = Some(Fragments::new(text, this.fragment_size));
+		Ok(())
+	}
+
+	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+		let this = self.get_mut();
+		ready!(this.poll_drain(cx))?;
+		Pin::new(&mut this.sink).poll_flush(cx)
+	}
+
+	fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+		let this = self.get_mut();
+		ready!(this.poll_drain(cx))?;
+		let reason = this.close.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		if let Some(reason) = reason {
+			ready!(Pin::new(&mut this.sink).poll_ready(cx))?;
+			// Detach from the slot so that a re-polled close does not send the frame again; the
+			// session keeps the reason for Session::close_reason.
+			let frame = CloseFrame { code: CloseCode::from(reason.code), reason: reason.reason.into_owned().into() };
+			this.close = CloseSlot::default();
+			Pin::new(&mut this.sink).start_send(Message::Close(Some(frame)))?;
+		}
+		Pin::new(&mut this.sink).poll_close(cx)
+	}
 }
 
 /// Splits a text message into WebSocket frames of at most `fragment_size` bytes, preferring
 /// character boundaries. If a character cannot fit, its bytes span multiple frames; WebSocket
 /// text messages need valid UTF-8 only after reassembly.
-fn message_fragments(mut text: String, fragment_size: Option<usize>) -> impl Iterator<Item = Message> {
-	let mut start = 0;
-	let mut done = false;
-	std::iter::from_fn(move || {
-		if done {
+struct Fragments {
+	text: String,
+	start: usize,
+	size: usize,
+	done: bool,
+}
+
+impl Fragments {
+	fn new(text: String, fragment_size: Option<usize>) -> Self {
+		let size = fragment_size.filter(|size| *size > 0).unwrap_or(usize::MAX);
+		Fragments { text, start: 0, size, done: false }
+	}
+}
+
+impl Iterator for Fragments {
+	type Item = Message;
+
+	fn next(&mut self) -> Option<Message> {
+		if self.done {
 			return None;
 		}
-		let size = fragment_size.filter(|size| *size > 0).unwrap_or(usize::MAX);
-		if text.len() <= size {
-			done = true;
-			return Some(Message::Text(std::mem::take(&mut text).into()));
+		let (text, start, size) = (&self.text, self.start, self.size);
+		if start == 0 && text.len() <= size {
+			self.done = true;
+			return Some(Message::Text(std::mem::take(&mut self.text).into()));
 		}
 		let limit = start + (text.len() - start).min(size);
 		let mut end = limit;
@@ -127,20 +204,26 @@ fn message_fragments(mut text: String, fragment_size: Option<usize>) -> impl Ite
 		}
 		let opcode = OpCode::Data(if start == 0 { Data::Text } else { Data::Continue });
 		let chunk = text.as_bytes()[start..end].to_vec();
-		done = end == text.len();
-		start = end;
-		Some(Message::Frame(WsFrame::message(chunk, opcode, done)))
-	})
+		self.done = end == text.len();
+		self.start = end;
+		if self.done {
+			// Release the message as soon as its last fragment is handed to the transport.
+			self.text = String::new();
+		}
+		Some(Message::Frame(WsFrame::message(chunk, opcode, self.done)))
+	}
 }
 
 #[cfg(test)]
 fn messages(text: String, fragment_size: Option<usize>) -> Vec<Message> {
-	message_fragments(text, fragment_size).collect()
+	Fragments::new(text, fragment_size).collect()
 }
 
 /// A displayable wrapper for the header list of a connect info.
+#[cfg(feature = "server")]
 pub(crate) struct Headers<'a>(pub &'a tokio_tungstenite::tungstenite::http::HeaderMap);
 
+#[cfg(feature = "server")]
 impl Headers<'_> {
 	pub(crate) fn to_vec(&self) -> Vec<(String, String)> {
 		self.0
@@ -150,6 +233,7 @@ impl Headers<'_> {
 	}
 }
 
+#[cfg(feature = "server")]
 impl fmt::Debug for Headers<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str("Headers([redacted])")
@@ -159,6 +243,7 @@ impl fmt::Debug for Headers<'_> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use futures_util::SinkExt;
 
 	#[test]
 	fn sends_small_messages_as_one_text_frame() {

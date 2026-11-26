@@ -8,8 +8,12 @@
 //! | `ACK` | `ACK` + id + optional JSON payload                              |
 //! | `NAK` | `NAK` + id + optional JSON payload (a [`ProblemDetail`])         |
 //! | `HBT` | `HBT` + heartbeat interval in milliseconds (decimal ASCII)      |
+//! | `AUT` | `AUT` + id (12 chars) + JSON object (the credential)            |
 //!
 //! Ids are 9 random bytes, base64url-encoded without padding — exactly 12 characters.
+//!
+//! An `AUT` frame carries a credential: its payload is never logged. [`Frame`]'s `Display` and
+//! `Debug` print `[redacted]` in its place.
 //!
 //! [`ProblemDetail`]: crate::ProblemDetail
 
@@ -24,7 +28,7 @@ const ID_BYTES: usize = 9;
 const PAYLOAD_INDEX: usize = TYPE_LENGTH + ID_LENGTH;
 
 /// A parsed VCMP frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Frame {
 	/// A message that expects an `ACK` or `NAK` with the same id.
 	Message {
@@ -52,6 +56,14 @@ pub enum Frame {
 		/// The heartbeat interval in milliseconds. Zero is syntactically valid but ignored.
 		interval: u64,
 	},
+	/// Client → server: authenticate the session with a credential, answered with `ACK` or `NAK`
+	/// with the same id. Never dispatched to message handlers.
+	Authenticate {
+		/// The frame id.
+		id: String,
+		/// The credential, a JSON object whose shape the endpoint defines. Never logged.
+		payload: String,
+	},
 }
 
 /// Why a raw text frame could not be parsed.
@@ -60,10 +72,10 @@ pub enum FrameError {
 	/// The frame is shorter than the type prefix.
 	#[error("frame too short: {0} bytes")]
 	TooShort(usize),
-	/// The type prefix is none of `MSG`, `ACK`, `NAK`, `HBT`.
+	/// The type prefix is none of `MSG`, `ACK`, `NAK`, `HBT`, `AUT`.
 	#[error("invalid frame type: {0:?}")]
 	InvalidType(String),
-	/// A `MSG`/`ACK`/`NAK` frame does not carry a full 12-character id.
+	/// A `MSG`/`ACK`/`NAK`/`AUT` frame does not carry a full 12-character id.
 	#[error("frame id is incomplete")]
 	IncompleteId,
 	/// The `HBT` interval is not a decimal number.
@@ -75,6 +87,11 @@ impl Frame {
 	/// Creates a `MSG` frame with a freshly generated id.
 	pub fn message(payload: impl Into<String>) -> Self {
 		Frame::Message { id: generate_id(), payload: payload.into() }
+	}
+
+	/// Creates an `AUT` frame with a freshly generated id.
+	pub fn authenticate(payload: impl Into<String>) -> Self {
+		Frame::Authenticate { id: generate_id(), payload: payload.into() }
 	}
 
 	/// Creates an `ACK` frame. An empty payload is normalized to `None`, matching the wire format
@@ -100,13 +117,17 @@ impl Frame {
 			Frame::Ack { .. } => "ACK",
 			Frame::Nak { .. } => "NAK",
 			Frame::Heartbeat { .. } => "HBT",
+			Frame::Authenticate { .. } => "AUT",
 		}
 	}
 
-	/// The id of a `MSG`/`ACK`/`NAK` frame; `None` for heartbeats.
+	/// The id of a `MSG`/`ACK`/`NAK`/`AUT` frame; `None` for heartbeats.
 	pub fn id(&self) -> Option<&str> {
 		match self {
-			Frame::Message { id, .. } | Frame::Ack { id, .. } | Frame::Nak { id, .. } => Some(id),
+			Frame::Message { id, .. }
+			| Frame::Ack { id, .. }
+			| Frame::Nak { id, .. }
+			| Frame::Authenticate { id, .. } => Some(id),
 			Frame::Heartbeat { .. } => None,
 		}
 	}
@@ -122,7 +143,7 @@ impl Frame {
 					.map(|interval| Frame::Heartbeat { interval })
 					.map_err(|_| FrameError::InvalidInterval(interval.to_owned()))
 			}
-			"MSG" | "ACK" | "NAK" => {
+			"MSG" | "ACK" | "NAK" | "AUT" => {
 				// Ids are 12 ASCII characters in every implementation; the reference implementations
 				// slice by (UTF-16) characters, which coincides with bytes exactly for ASCII.
 				let id = raw
@@ -133,6 +154,7 @@ impl Frame {
 				let payload = raw.get(PAYLOAD_INDEX..).unwrap_or_default();
 				Ok(match kind {
 					"MSG" => Frame::Message { id, payload: payload.to_owned() },
+					"AUT" => Frame::Authenticate { id, payload: payload.to_owned() },
 					"ACK" => Frame::ack(id, Some(payload.to_owned())),
 					_ => Frame::nak(id, Some(payload.to_owned())),
 				})
@@ -146,7 +168,7 @@ impl Frame {
 		let mut out = String::with_capacity(PAYLOAD_INDEX + self.payload_len());
 		out.push_str(self.kind());
 		match self {
-			Frame::Message { id, payload } => {
+			Frame::Message { id, payload } | Frame::Authenticate { id, payload } => {
 				out.push_str(id);
 				out.push_str(payload);
 			}
@@ -163,9 +185,14 @@ impl Frame {
 		out
 	}
 
+	/// The length of [`Frame::serialize`]'s output, at most 20 bytes more for heartbeats.
+	pub(crate) fn serialize_len(&self) -> usize {
+		PAYLOAD_INDEX + self.payload_len()
+	}
+
 	fn payload_len(&self) -> usize {
 		match self {
-			Frame::Message { payload, .. } => payload.len(),
+			Frame::Message { payload, .. } | Frame::Authenticate { payload, .. } => payload.len(),
 			Frame::Ack { payload, .. } | Frame::Nak { payload, .. } => payload.as_ref().map_or(0, String::len),
 			Frame::Heartbeat { .. } => 20,
 		}
@@ -174,21 +201,42 @@ impl Frame {
 
 impl fmt::Display for Frame {
 	/// A log-friendly rendering: type, id and a truncated payload (like the Java `toString`).
+	/// An `AUT` payload (a credential) is replaced by `[redacted]`.
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Frame::Heartbeat { interval } => write!(f, "HBT {interval}ms"),
+			Frame::Authenticate { id, .. } => write!(f, "AUT#{id}:{REDACTED}"),
 			_ => {
 				write!(f, "{}#{}", self.kind(), self.id().unwrap_or_default())?;
 				let payload = match self {
 					Frame::Message { payload, .. } => Some(payload.as_str()),
 					Frame::Ack { payload, .. } | Frame::Nak { payload, .. } => payload.as_deref(),
-					Frame::Heartbeat { .. } => None,
+					Frame::Heartbeat { .. } | Frame::Authenticate { .. } => None,
 				};
 				if let Some(payload) = payload {
 					let end = payload.char_indices().nth(36).map_or(payload.len(), |(i, _)| i);
 					write!(f, ":{}{}", &payload[..end], if end < payload.len() { "..." } else { "" })?;
 				}
 				Ok(())
+			}
+		}
+	}
+}
+
+const REDACTED: &str = "[redacted]";
+
+impl fmt::Debug for Frame {
+	/// Like a derived `Debug`, except that an `AUT` payload (a credential) is `[redacted]`.
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Frame::Message { id, payload } => {
+				f.debug_struct("Message").field("id", id).field("payload", payload).finish()
+			}
+			Frame::Ack { id, payload } => f.debug_struct("Ack").field("id", id).field("payload", payload).finish(),
+			Frame::Nak { id, payload } => f.debug_struct("Nak").field("id", id).field("payload", payload).finish(),
+			Frame::Heartbeat { interval } => f.debug_struct("Heartbeat").field("interval", interval).finish(),
+			Frame::Authenticate { id, .. } => {
+				f.debug_struct("Authenticate").field("id", id).field("payload", &REDACTED).finish()
 			}
 		}
 	}
@@ -267,6 +315,10 @@ mod tests {
 		assert_eq!(Frame::nak("123456789012", None).serialize(), "NAK123456789012");
 		assert_eq!(Frame::nak("123456789012", Some("foo".into())).serialize(), "NAK123456789012foo");
 		assert_eq!(Frame::heartbeat(1000).serialize(), "HBT1000");
+		assert_eq!(
+			Frame::Authenticate { id: "123456789012".into(), payload: "{}".into() }.serialize(),
+			"AUT123456789012{}"
+		);
 	}
 
 	#[test]
@@ -281,6 +333,14 @@ mod tests {
 		assert_eq!(Frame::parse("NAK123456789012foo").unwrap(), Frame::nak("123456789012", Some("foo".into())));
 		assert_eq!(Frame::parse("HBT1000").unwrap(), Frame::heartbeat(1000));
 		assert_eq!(Frame::parse("HBT0").unwrap(), Frame::heartbeat(0));
+		assert_eq!(
+			Frame::parse(r#"AUT123456789012{"token":"t"}"#).unwrap(),
+			Frame::Authenticate { id: "123456789012".into(), payload: r#"{"token":"t"}"#.into() }
+		);
+		assert_eq!(
+			Frame::parse("AUT123456789012").unwrap(),
+			Frame::Authenticate { id: "123456789012".into(), payload: String::new() }
+		);
 	}
 
 	#[test]
@@ -297,6 +357,7 @@ mod tests {
 		assert_eq!(Frame::parse("MS").unwrap_err(), FrameError::TooShort(2));
 		assert_eq!(Frame::parse("XXXsomething").unwrap_err(), FrameError::InvalidType("XXX".into()));
 		assert_eq!(Frame::parse("MSG12345").unwrap_err(), FrameError::IncompleteId);
+		assert_eq!(Frame::parse("AUT12345").unwrap_err(), FrameError::IncompleteId);
 		assert_eq!(Frame::parse("MSGäääääää").unwrap_err(), FrameError::IncompleteId);
 		assert_eq!(Frame::parse("HBT").unwrap_err(), FrameError::InvalidInterval(String::new()));
 		assert_eq!(Frame::parse("HBTfoo").unwrap_err(), FrameError::InvalidInterval("foo".into()));
@@ -309,6 +370,23 @@ mod tests {
 		assert_eq!(frame.to_string(), format!("MSG#123456789012:{}...", "x".repeat(36)));
 		assert_eq!(Frame::heartbeat(20000).to_string(), "HBT 20000ms");
 		assert_eq!(Frame::ack("123456789012", None).to_string(), "ACK#123456789012");
+	}
+
+	#[test]
+	fn never_renders_an_authentication_payload() {
+		let frame = Frame::Authenticate { id: "123456789012".into(), payload: r#"{"token":"secret"}"#.into() };
+		assert_eq!(frame.to_string(), "AUT#123456789012:[redacted]");
+		let debug = format!("{frame:?}");
+		assert!(!debug.contains("secret"), "{debug}");
+		assert!(debug.contains("123456789012"), "{debug}");
+		assert!(format!("{:?}", Frame::message("visible")).contains("visible"));
+	}
+
+	#[test]
+	fn generates_authentication_ids_like_message_ids() {
+		let id = Frame::authenticate("{}").id().unwrap().to_owned();
+		assert_eq!(id.len(), ID_LENGTH);
+		assert!(id.bytes().all(|b| BASE64URL.contains(&b)), "{id}");
 	}
 
 	fn id_strategy() -> impl Strategy<Value = String> {
