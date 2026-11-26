@@ -124,7 +124,7 @@ fn provider_failed(detail: &str) -> VcmpError {
 }
 
 /// The smallest answer timeout a client accepts.
-pub const MIN_AUTH_INTERVAL: Duration = Duration::from_secs(1);
+pub const MIN_AUTH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Why authenticating a session (first `AUT` or re-authentication) failed.
 enum AuthFailure {
@@ -177,9 +177,9 @@ impl ClientBuilder {
 	///
 	/// # Panics
 	///
-	/// When `timeout` is shorter than [`MIN_AUTH_INTERVAL`] (1 s): a configuration error.
+	/// When `timeout` is shorter than [`MIN_AUTH_TIMEOUT`] (1 s): a configuration error.
 	pub fn auth_timeout(mut self, timeout: Duration) -> Self {
-		assert!(timeout >= MIN_AUTH_INTERVAL, "the authentication answer timeout must be at least 1 s");
+		assert!(timeout >= MIN_AUTH_TIMEOUT, "the authentication answer timeout must be at least 1 s");
 		self.auth_timeout = timeout;
 		self
 	}
