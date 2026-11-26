@@ -103,7 +103,3 @@ pub async fn wait_until(condition: impl Fn() -> bool) {
 	.await
 	.expect("condition not met in time");
 }
-
-pub fn free_port() -> u16 {
-	std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}

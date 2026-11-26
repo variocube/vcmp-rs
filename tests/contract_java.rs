@@ -24,6 +24,7 @@ fn peer(args: &[&str]) -> Command {
 	command
 }
 
+/// A Spring server peer on `port`; `0` lets it pick a free one (see [`PeerProcess::listening_port`]).
 async fn java_server(port: u16, heartbeat_ms: u64) -> PeerProcess {
 	let peer = PeerProcess::spawn(peer(&["server", &port.to_string(), &heartbeat_ms.to_string()])).await;
 	peer.wait_for("READY", 1).await;
@@ -56,8 +57,8 @@ async fn java_client(url: &str) -> PeerProcess {
 #[ignore = "needs a JDK and the vcmp-spring checkout"]
 async fn rust_client_against_spring_server() {
 	init_tracing();
-	let port = free_port();
-	let mut server = java_server(port, 200).await;
+	let mut server = java_server(0, 200).await;
+	let port = server.listening_port();
 	let client = rust_client(&format!("ws://127.0.0.1:{port}/peer/rust"));
 	client.start();
 	tokio::time::timeout(TIMEOUT, client.wait_connected()).await.unwrap();
@@ -73,6 +74,8 @@ async fn rust_client_against_spring_server() {
 	// server restart → client reconnects and a send after reconnect succeeds
 	server.kill().await;
 	tokio::time::timeout(TIMEOUT, client.wait_disconnected()).await.unwrap();
+	// The restarted peer binds the same port again (the client's URL is fixed): it was the peer's until the kill, so
+	// only a process taking it in that gap could fail the restart — an accepted residual risk.
 	let mut server = java_server(port, 200).await;
 	tokio::time::timeout(TIMEOUT, client.wait_connected()).await.unwrap();
 	assert_eq!(client.send(&Echo { payload: "again".into() }).await.unwrap(), "again");
@@ -104,8 +107,8 @@ async fn axum_server_against_spring_client() {
 
 async fn server_against_spring_client(host: ServerHost) {
 	init_tracing();
-	let port = free_port();
-	let (server, endpoint) = rust_server(host, port, Duration::from_millis(200)).await;
+	let (server, endpoint) = rust_server(host, 0, Duration::from_millis(200)).await;
+	let port = server.local_addr().port();
 	let url = format!("ws://127.0.0.1:{port}/peer/java");
 	let mut client = java_client(&url).await;
 	client.wait_for("CONNECTED", 1).await;
@@ -123,6 +126,8 @@ async fn server_against_spring_client(host: ServerHost) {
 	// server restart → the Spring client reconnects and a send after reconnect succeeds
 	server.stop().await;
 	client.wait_for("DISCONNECTED", 1).await;
+	// The restart binds the same port again (the peer's URL is fixed): it was ours until stop(), so only a process
+	// taking it in that gap could fail the bind — an accepted residual risk.
 	let (server, endpoint) = rust_server(host, port, Duration::from_millis(200)).await;
 	client.wait_for("CONNECTED", 2).await;
 	wait_until(|| endpoint.session_count() == 1).await;
@@ -148,9 +153,9 @@ async fn server_against_spring_client(host: ServerHost) {
 #[ignore = "needs a JDK and the vcmp-spring checkout"]
 async fn aut_against_spring_server() {
 	init_tracing();
-	let port = free_port();
 	// One Spring app serves /peer/{name} (no opt-in) and /auth/{name} (AuthServerPeer).
-	let mut server = java_server(port, 20000).await;
+	let mut server = java_server(0, 20000).await;
+	let port = server.listening_port();
 	let target = auth::AuthTarget {
 		auth: format!("ws://127.0.0.1:{port}/auth/raw"),
 		open: format!("ws://127.0.0.1:{port}/peer/raw"),

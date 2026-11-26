@@ -2,6 +2,7 @@
 
 mod common;
 
+use common::server_host::ReservedPort;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -211,8 +212,8 @@ async fn initial_heartbeat_expectation_can_be_disabled() {
 
 async fn reconnects_after_a_server_restart(host: ServerHost) {
 	init_tracing();
-	let port = free_port();
-	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
+	let port = server.local_addr().port();
 	let client = client(&format!("ws://127.0.0.1:{port}/test/a"));
 	let opens = Arc::new(AtomicUsize::new(0));
 	let closes = Arc::new(AtomicUsize::new(0));
@@ -246,6 +247,8 @@ async fn reconnects_after_a_server_restart(host: ServerHost) {
 	assert_eq!((error.status(), error.title()), (503, "Not connected"));
 	assert!(error.is_transport());
 
+	// The restart binds the same port again (the client's URL is fixed): it was ours until stop(), so only a process
+	// taking it in that gap could fail the bind — an accepted residual risk.
 	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	connected(&client).await;
 	assert_eq!(client.send(&Void {}).await.unwrap(), serde_json::Value::Null);
@@ -284,8 +287,8 @@ async fn stop_fails_pending_sends_and_does_not_reconnect(host: ServerHost) {
 
 async fn start_cancels_a_pending_reconnect_and_replaces_the_session(host: ServerHost) {
 	init_tracing();
-	let port = free_port();
-	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
+	let (server, _endpoint) = start_hosted_server(host, 0, Duration::from_secs(20)).await;
+	let port = server.local_addr().port();
 	let client = VcmpClient::builder(format!("ws://127.0.0.1:{port}/test/a"))
 		.reconnect(Backoff::fixed(Duration::from_secs(60)))
 		.build();
@@ -294,6 +297,8 @@ async fn start_cancels_a_pending_reconnect_and_replaces_the_session(host: Server
 	server.stop().await;
 	disconnected(&client).await;
 	// a reconnect is pending in 60 s; start() must connect right away instead
+	// The restart binds the same port again (the client's URL is fixed): it was ours until stop(), so only a process
+	// taking it in that gap could fail the bind — an accepted residual risk.
 	let (server, endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	client.start();
 	connected(&client).await;
@@ -312,12 +317,16 @@ async fn start_cancels_a_pending_reconnect_and_replaces_the_session(host: Server
 
 async fn keeps_retrying_when_the_server_is_unreachable_or_rejects(host: ServerHost) {
 	init_tracing();
-	let port = free_port();
+	// The client's URL is fixed before the server exists; the port stays reserved until right before the bind.
+	// Unreachable meanwhile: refused on Linux, a hanging connect on BSD/macOS (not connected either way).
+	let reserved = ReservedPort::bind();
+	let port = reserved.port();
 	let client = client(&format!("ws://127.0.0.1:{port}/nope"));
 	client.start();
 	tokio::time::sleep(Duration::from_millis(300)).await;
 	assert!(!client.is_connected());
 	// a server without that endpoint rejects with 404; the client keeps retrying
+	drop(reserved);
 	let (server, _endpoint) = start_hosted_server(host, port, Duration::from_secs(20)).await;
 	tokio::time::sleep(Duration::from_millis(300)).await;
 	assert!(!client.is_connected());
@@ -606,7 +615,8 @@ fn line_with<'a>(log: &'a str, needle: &str) -> &'a str {
 async fn logs_redacted_url_and_error_when_connect_fails() {
 	let logs = LogBuffer::default();
 	let _guard = logs.install();
-	let port = free_port();
+	// Port 1: nothing listens there and it is refused on every OS (a freed port could be taken by a parallel test).
+	let port = 1;
 	let client = client(&format!("ws://user:pw@127.0.0.1:{port}/drivers/keypad?access_token=secret"));
 	client.start();
 
@@ -630,8 +640,7 @@ async fn logs_redacted_url_and_error_when_connect_fails() {
 async fn invalid_header_names_are_never_logged() {
 	let logs = LogBuffer::default();
 	let _guard = logs.install();
-	let port = free_port();
-	let url = format!("ws://127.0.0.1:{port}/x");
+	let url = "ws://127.0.0.1:1/x".to_string();
 	let fixed = VcmpClient::builder(url.clone())
 		.header("Authorization: Bearer tokenstatic", "v")
 		.reconnect(Backoff::fixed(Duration::from_millis(100)))
